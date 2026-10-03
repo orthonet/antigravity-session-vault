@@ -48,6 +48,12 @@ class CatalogManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_retention ON backed_up_conversations(retention_status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_category ON backed_up_conversations(category);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_workspace ON backed_up_conversations(workspace_uris);")
+            # Reconcile any existing records that were complete_active but evicted from live
+            conn.execute("""
+            UPDATE backed_up_conversations
+            SET retention_status = 'safeguarded_evicted'
+            WHERE retention_status = 'complete_active' AND is_evicted_from_live = 1;
+            """)
             conn.commit()
 
     def get_summary_metrics(self) -> Dict[str, Any]:
@@ -56,8 +62,11 @@ class CatalogManager:
             cur.execute("SELECT COUNT(*) FROM backed_up_conversations")
             total = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM backed_up_conversations WHERE retention_status = 'complete_active'")
+            cur.execute("SELECT COUNT(*) FROM backed_up_conversations WHERE retention_status = 'complete_active' AND is_evicted_from_live = 0")
             complete_active = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM backed_up_conversations WHERE retention_status = 'safeguarded_evicted' OR (retention_status = 'complete_active' AND is_evicted_from_live = 1)")
+            safeguarded_evicted = cur.fetchone()[0]
 
             cur.execute("SELECT COUNT(*) FROM backed_up_conversations WHERE retention_status = 'metadata_only_evicted'")
             metadata_only = cur.fetchone()[0]
@@ -77,9 +86,11 @@ class CatalogManager:
             return {
                 "total": total,
                 "complete_active": complete_active,
+                "safeguarded_evicted": safeguarded_evicted,
                 "metadata_only_evicted": metadata_only,
                 "imported_from_offsite": offsite_imported,
                 "pinned": pinned,
+                "workspaces": len(self.get_workspace_counts()),
                 "interactive": interactive,
                 "automated_queue": queue,
             }
@@ -123,6 +134,9 @@ class CatalogManager:
             ret_counts = {r[0]: r[1] for r in cur.fetchall()}
             cur.execute("SELECT COUNT(*) FROM backed_up_conversations")
             ret_counts["total"] = cur.fetchone()[0]
+            # Ensure all expected keys exist
+            for k in ["complete_active", "safeguarded_evicted", "imported_from_offsite", "metadata_only_evicted"]:
+                ret_counts.setdefault(k, 0)
             return ret_counts
 
     def query_conversations(

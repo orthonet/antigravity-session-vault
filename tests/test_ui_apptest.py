@@ -209,12 +209,12 @@ class TestStreamlitUIAppTest(unittest.TestCase):
             self.assertGreater(len(active_btns), 0, "Explorer must render Active in Antigravity indicators for active sessions")
             for ab in active_btns[:3]:
                 self.assertTrue(ab.disabled)
-                self.assertIn("Active in Antigravity", ab.label)
+                self.assertIn("Active in AGY", ab.label)
 
             # 2. Select 'imported_from_offsite' filter to locate restorable evicted sessions
             ret_sb = at.selectbox(key="explorer_ret_filter")
             self.assertIsNotNone(ret_sb, "Retention status selectbox must be found in Explorer")
-            target_opt = next((opt for opt in ret_sb.options if "Imported from Offsite" in opt or "imported_from_offsite" in opt), ret_sb.options[-1])
+            target_opt = next((opt for opt in ret_sb.options if "Recovered from Offsite" in opt or "imported_from_offsite" in opt), ret_sb.options[-2])
             ret_sb.set_value(target_opt).run()
             self.assertEqual(len(at.exception), 0)
 
@@ -264,7 +264,7 @@ class TestStreamlitUIAppTest(unittest.TestCase):
             act_btn = at_active.button(key="viewer_act_btn")
             self.assertIsNotNone(act_btn, "Active session in Viewer must render viewer_act_btn")
             self.assertTrue(act_btn.disabled)
-            self.assertIn("Active in Antigravity", act_btn.label)
+            self.assertIn("Active in AGY", act_btn.label)
 
             # 2. Evicted session test: must render 'Restore to Sidebar #1' and autopopulated workspace selector
             evicted_convs = cat.query_conversations(retention_filter="imported_from_offsite", limit=1)
@@ -313,6 +313,142 @@ class TestStreamlitUIAppTest(unittest.TestCase):
         caption_texts = [c.value for c in at.caption]
         has_archive_path = any("Archive Path" in c for c in caption_texts)
         self.assertTrue(has_archive_path, f"Archive Path caption must be present in sidebar. Captions found: {caption_texts}")
+
+    def test_safeguarded_evicted_ui_filtering_and_sidebar_metrics(self):
+        """Verify sidebar metrics render new labels and Explorer filters safeguarded_evicted sessions with restore buttons."""
+        def fake_restore(cid, target_workspace_uri=None, overwrite_live=False, catalog_manager=None):
+            return {
+                "success": True,
+                "conversation_id": cid,
+                "restored_at": "2026-10-03T00:00:00Z",
+                "workspace": target_workspace_uri,
+                "message": f"Conversation '{cid}' restored successfully! It is now slot #1 in your Antigravity sidebar."
+            }
+
+        with patch("core.restorer.restore_conversation", side_effect=fake_restore):
+            at = AppTest.from_file("../app.py", default_timeout=20)
+            at.session_state["main_nav_tab"] = "📂 Conversation Explorer"
+            at.run()
+
+            self.assertEqual(len(at.exception), 0, f"AppTest raised unexpected exception: {at.exception}")
+
+            # 1. Assert sidebar metrics contain the new labels
+            metric_labels = [m.label for m in at.metric if m.label]
+            self.assertIn("🟢 Active in AGY", metric_labels, f"Expected '🟢 Active in AGY' in sidebar metrics, got: {metric_labels}")
+            self.assertIn("🛡️ Safeguarded", metric_labels, f"Expected '🛡️ Safeguarded' in sidebar metrics, got: {metric_labels}")
+            self.assertIn("📥 Offsite Restored", metric_labels, f"Expected '📥 Offsite Restored' in sidebar metrics, got: {metric_labels}")
+            self.assertIn("📋 Metadata Only", metric_labels, f"Expected '📋 Metadata Only' in sidebar metrics, got: {metric_labels}")
+
+            # 2. Select 'safeguarded_evicted' in retention filter
+            ret_sb = at.selectbox(key="explorer_ret_filter")
+            self.assertIsNotNone(ret_sb)
+            target_opt = next((opt for opt in ret_sb.options if "Safeguarded in Vault" in opt), None)
+            self.assertIsNotNone(target_opt, f"Expected 'Safeguarded in Vault' option in {ret_sb.options}")
+            ret_sb.set_value(target_opt).run()
+
+            self.assertEqual(len(at.exception), 0)
+
+            # 3. Assert safeguarded badge is rendered in the HTML/markdown cards
+            markdown_texts = [m.value for m in at.markdown]
+            has_safeguarded_badge = any("badge-safeguarded" in text or "🛡️ Safeguarded (Evicted)" in text for text in markdown_texts)
+            self.assertTrue(has_safeguarded_badge, "Expected '🛡️ Safeguarded (Evicted)' badge in rendered conversation cards")
+
+            # 4. Assert enabled '⚡ Restore to Live' buttons exist for safeguarded sessions
+            restore_btns = [b for b in at.button if b.key and b.key.startswith("res_") and not b.disabled]
+            self.assertGreater(len(restore_btns), 0, "Safeguarded sessions must provide an enabled '⚡ Restore to Live' button")
+            self.assertIn("Restore to Live", restore_btns[0].label)
+
+            # 5. Click restore button and verify reactive feedback
+            restore_btns[0].click().run()
+            self.assertEqual(len(at.exception), 0)
+            success_texts = [s.value for s in at.success]
+            self.assertTrue(
+                any("Restored to Slot #1" in s for s in success_texts),
+                f"Expected restore confirmation banner, got: {success_texts}"
+            )
+
+    def test_sidebar_sync_live_now_and_tab5_pin_sentry(self):
+        """Verify sidebar Sync Live Now executes cleanly, renders full-width message, and Tab 5 renders Pin Sentry protection."""
+        def fake_sync(auto_protect_pinned=True):
+            return {
+                "success": True,
+                "synced_at": "2026-10-03T00:00:00Z",
+                "synced_dbs": 2,
+                "synced_brains": 2,
+                "pin_sentry": {"protected_count": 11, "auto_resurrected": 0, "refreshed": 1, "errors": []},
+                "errors": []
+            }
+
+        with patch("core.backup_engine.sync_live_to_backup", side_effect=fake_sync):
+            at = AppTest.from_file("../app.py", default_timeout=20)
+            at.run()
+
+            self.assertEqual(len(at.exception), 0, f"App execution raised: {at.exception}")
+
+            # 1. Verify '💼 Workspaces' and '⭐ Pinned' metrics exist in sidebar
+            sidebar_metric_labels = [m.label for m in at.metric if m.label]
+            self.assertIn("💼 Workspaces", sidebar_metric_labels, "Expected '💼 Workspaces' metric in sidebar")
+            self.assertIn("⭐ Pinned", sidebar_metric_labels, "Expected '⭐ Pinned' metric in sidebar")
+
+            # 2. Verify '🔄 Sync Live Now' button exists in sidebar and can be clicked
+            sync_btn = next((b for b in at.button if "Sync Live Now" in b.label), None)
+            self.assertIsNotNone(sync_btn, "Sync Live Now button must exist in sidebar")
+            sync_btn.click().run()
+
+            self.assertEqual(len(at.exception), 0, f"Clicking Sync Live Now raised: {at.exception}")
+            # Assert full-width success banner renders
+            self.assertTrue(
+                any("Synced 2 DBs" in s.value for s in at.success),
+                f"Expected sync success banner, got: {[s.value for s in at.success]}"
+            )
+
+            # 3. Switch to Tab 5 (Health & Settings) and assert Pin Sentry controls
+            at.session_state["main_nav_tab"] = "⚙️ Health & Settings"
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+
+            # Assert Pinned Sessions and Active in Antigravity metrics
+            metric_labels = [m.label for m in at.metric if m.label]
+            self.assertIn("⭐ Protected Pinned Sessions", metric_labels)
+            self.assertIn("🟢 Active in Antigravity", metric_labels)
+
+            # Assert Run Pin Sentry button exists
+            sentry_btn = at.button(key="btn_run_sentry_now")
+            self.assertIsNotNone(sentry_btn, "btn_run_sentry_now must exist in Tab 5")
+
+    def test_sidebar_daemon_start_and_stop_lifecycle(self):
+        """Verify sidebar Start and Stop daemon buttons interact cleanly and render full-width status feedback."""
+        with patch("core.daemon.get_daemon_live_status", return_value=("⚪ Inactive", "Daemon not running", {})), \
+             patch("core.daemon.start_daemon_process", return_value=(True, 4242)):
+            at = AppTest.from_file("../app.py", default_timeout=20)
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+
+            # Start button should be visible when Inactive
+            start_btn = at.button(key="sidebar_start_daemon_btn")
+            self.assertIsNotNone(start_btn, "Start daemon button must exist when daemon is inactive")
+            start_btn.click().run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(
+                any("Sync daemon started (PID 4242)" in s.value for s in at.success),
+                f"Expected start confirmation banner, got: {[s.value for s in at.success]}"
+            )
+
+        with patch("core.daemon.get_daemon_live_status", return_value=("🟢 Active", "PID 4242 • Synced 5s ago", {})), \
+             patch("core.daemon.stop_daemon_process", return_value=True):
+            at = AppTest.from_file("../app.py", default_timeout=20)
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+
+            # Stop button should be visible when Active
+            stop_btn = at.button(key="sidebar_stop_daemon_btn")
+            self.assertIsNotNone(stop_btn, "Stop daemon button must exist when daemon is active")
+            stop_btn.click().run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(
+                any("Sync daemon stopped cleanly" in i.value for i in at.info),
+                f"Expected stop confirmation banner, got: {[i.value for i in at.info]}"
+            )
 
 if __name__ == "__main__":
     unittest.main()

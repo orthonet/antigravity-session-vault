@@ -3,10 +3,10 @@
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/streamlit-1.35%2B-FF4B4B.svg)](https://streamlit.io/)
 [![SQLite](https://img.shields.io/badge/sqlite-WAL%20Mode-003B57.svg)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-28%2F28%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-36%2F36%20passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Autonomous Continuous Backup, Lossless Archival Storage, Full-Text Retrieval, and 1-Click IDE Revival for Google Antigravity.**
+**Autonomous Continuous Backup, Lossless Archival Storage, Full-Text Retrieval, Vault Pin Sentry Anti-Re-Eviction Defense, and 1-Click IDE Revival for Google Antigravity.**
 
 ---
 
@@ -26,7 +26,7 @@
 
 ## 🚨 The Root Cause: Why Antigravity Conversations Disappear
 
-If you have upgraded Antigravity or run autonomous scheduled tasks and noticed older conversations vanishing, here is what actually happens under the hood:
+Forensic reverse-engineering and disassembly of Antigravity's underlying language server process (`language_server.exe`, a 64-bit PE compiled Go binary embedded within the IDE) reveals the exact architectural mechanism causing session loss:
 
 ```
 LIVE ANTIGRAVITY STORAGE (~/.gemini/antigravity/)
@@ -35,9 +35,9 @@ LIVE ANTIGRAVITY STORAGE (~/.gemini/antigravity/)
 └── brain/<id>/                 <-- Permanently deleted once session exceeds ~500!
 ```
 
-1. **Hardcoded ~500-Session Rolling Eviction Cap**: Antigravity's background language server process enforces a rolling retention limit of approximately 500 active sessions.
-2. **Permanent Unrecoverable Deletions**: Once the count exceeds ~500, the system permanently purges both the conversation trajectory database (`conversations/<id>.db`) and the brain directory (`brain/<id>/`). These deletions bypass the OS Recycle Bin / Trash entirely.
-3. **The "Pinned" Session Bug**: Even if you explicitly "Pin" an important conversation in the UI (writing `pinned: true` into `annotations/<id>.pbtxt`), the eviction engine purges sessions based purely on `last_modified_time`. Pinned sessions are silently deleted once 500 subsequent sessions occur.
+1. **Hardcoded ~500-Session Rolling Eviction Cap**: `language_server.exe` runs a periodic garbage-collection sweep enforcing a rolling retention ceiling of approximately 500 active sessions.
+2. **Permanent Unrecoverable Deletions**: Once the count exceeds ~500, the system purges older sessions directly via Win32 `DeleteFileW` and `RemoveDirectoryW` (POSIX `unlink`/`rmdir`), unlinking both `conversations/<id>.db` and the corresponding `brain/<id>/` directories. **These deletions completely bypass the OS Recycle Bin / Trash.**
+3. **The "Pinned" Session Vulnerability**: Even if you explicitly "Pin" an important conversation in the UI (writing `pinned: true` into `annotations/<id>.pbtxt`), the eviction engine sorts candidate files **strictly by file modification time (`last_modified_time`) and completely ignores the pinned annotation**. Once 500 subsequent sessions occur, pinned conversations drift to the tail end of the eviction queue and are permanently wiped from disk.
 4. **Devastating for Autonomous / Scheduled Agents**: If you run scheduled cron agents or queue-based tasks (e.g., every 10–15 minutes), your agent generates 100–140+ conversations per day. **Your entire 500-session history is completely recycled and deleted every 3 to 4 days.**
 5. **The "Phantom Catalog" Illusion**: Antigravity retains session titles in `conversation_summaries.db`. Your sidebar still lists old conversations, but clicking any of them fails with:
    > *"The conversation could not be loaded because its data was not found."*
@@ -48,21 +48,26 @@ LIVE ANTIGRAVITY STORAGE (~/.gemini/antigravity/)
 
 Antigravity Session Vault provides complete protection against silent eviction:
 
-### 🛡️ 1. Continuous Background Sync Daemon (`core/daemon.py`)
+### 🛡️ 1. Vault Pin Sentry (Anti-Re-Eviction Defense) (`core/pin_sentry.py`)
+- **Automated Keep-Alive Heartbeat**: Prevents pinned sessions from aging out by periodically refreshing `last_modified_time` timestamps within Antigravity's active evaluation window.
+- **Self-Healing Auto-Resurrection**: If an eviction occurs during offline periods or rapid language server sweeps, Pin Sentry detects the missing live `.db` or `brain/` folder and automatically resurrects them from the Vault back into live Antigravity without manual intervention.
+- **Unified Sync Integration**: Automatically runs during every continuous sync cycle or via 1-click manual trigger.
+
+### 🔄 2. Continuous Background Sync Daemon (`core/daemon.py`)
 - Automatically monitors live Antigravity files every 30 seconds.
 - Mirrors conversation databases (`.db`), brain directories (`brain/`), and annotations (`.pbtxt`) to an independent, safe archive location.
 - Uses online SQLite snapshots (`sqlite3.backup()`) with read-only connection handles to safely flush and integrate active WAL pages (`.db-wal`) without database locking collisions.
-- Features a single-instance PID lock (`daemon.pid`) and clean signal handling.
+- Features a single-instance PID lock (`daemon.pid`), live JSON heartbeat telemetry (`daemon_heartbeat.json`), and isolated stdout/stderr logging (`daemon.log`).
 - Immune to Windows NTFS read-only file traps (`[Errno 13] Permission denied` on Git loose objects).
 
-### ⚡ 2. 1-Click IDE Session Revival (`core/restorer.py`)
+### ⚡ 3. 1-Click IDE Session Revival (`core/restorer.py`)
 - Revive any archived or evicted conversation directly back into your live Antigravity IDE sidebar.
 - Bumps the session to **Slot #1 under "Today"** in your workspace.
 - **Active Session Protection**: If a conversation is currently active in Antigravity, restoration preserves your newer live steps and will never clobber active progress unless explicitly requested (`overwrite_live=True`).
 - **Target Workspace Remapping**: Restore a conversation back to its original workspace URI or redirect it into a new project workspace.
 - **Atomic Rollback**: If an error occurs during restore, newly created files are cleanly unlinked, preventing orphaned state.
 
-### 📦 3. Offsite Backup Importer (`core/importer.py`)
+### 📦 4. Offsite Backup Importer (`core/importer.py`)
 - Recovers historical conversations from external USB drives, Acronis, Time Machine, or NAS backups.
 - Automatically discovers uncatalogued trajectory `.db` files and nested `conversation_summaries.db` sources.
 - **4-Tier Mathematical Reconciliation**:
@@ -71,16 +76,18 @@ Antigravity Session Vault provides complete protection against silent eviction:
   - ✅ **Already in Vault**: Safely skips identical, up-to-date archives.
   - 📋 **Total Discovered**: 100% accounted for with zero silent dropping.
 
-### 🔍 4. Global Full-Text Deep Search (`core/search_engine.py`)
+### 🔍 5. Global Full-Text Deep Search (`core/search_engine.py`)
 - Blazing-fast sub-second search across all archived conversation SQLite databases.
 - Searches user queries, agent thought processes, tool invocations, and code payloads.
 - Displays contextual snippets with search keyword highlighting and direct links into the conversation viewer.
 
-### 📂 5. Interactive Streamlit Web Dashboard (`app.py`)
-- **Conversation Explorer**: Filter by status (`🟢 Complete Active`, `📦 Offsite Imported`, `⚠️ Metadata Only (Evicted)`), category (`Pinned`, `Interactive`, `Automated Queue`), or workspace.
+### 📂 6. Interactive Streamlit Web Dashboard (`app.py`)
+- **Balanced 3x2 Metrics Grid**: Real-time stats displaying `🟢 Active in AGY`, `🛡️ Safeguarded`, `📋 Metadata Only`, `📥 Offsite Restored`, `⭐ Pinned`, and `💼 Workspaces`.
+- **Integrated Daemon & Sentry Controller**: Live process indicator (`🟢 Active`, PID, last sync elapsed time, protected pinned count) with 1-click Start/Stop and non-blocking 15-second `@st.fragment` background refreshes.
+- **Full-Width Responsive UI**: Seamless intermediate progress spinners and action feedback banners spanning 100% of sidebar width.
+- **Conversation Explorer**: Filter by granular retention status (`🟢 Complete Active`, `📦 Imported from Offsite`, `⚠️ Metadata Only (Evicted)`, `📭 Metadata Only (No Backup)`), category (`Pinned`, `Interactive`, `Automated Queue`), or workspace.
 - **Self-Contained File Payload Extraction**: Antigravity saves complete, uncompressed files generated via `write_to_file` inside `steps.step_payload`. The viewer extracts and displays all code files, `task.md`, `implementation_plan.md`, and walkthroughs—**even if the brain folder was deleted**.
 - **Complete Timeline & Transcript Viewer**: Review chronological turns, tool executions, and diffs with full copy/download controls.
-- **System Health Monitor**: Live daemon heartbeat tracking, catalog metrics, and storage diagnostics.
 - **Dual-Theme Adaptive UI**: Seamless native Light and Dark mode auto-detection with high-contrast token borders.
 
 ---
@@ -209,9 +216,9 @@ Open your browser to: **`http://localhost:8501`**
 
 ## 🧪 Rigorous Testing & Verification
 
-Antigravity Session Vault enforces strict autonomous quality assurance standards:
-- **Backend Invariant Tests**: Mathematical conservation laws ($\sum \text{buckets} = \text{total}$), monotonicity laws (sessions can upgrade but never downgrade), online SQLite WAL backups, atomic rollback, and path-traversal security verification.
-- **Headless UI Tests**: Streamlit's official `st.testing.v1.AppTest` framework simulating clicks, tab switches, segmented control toggling, and button interactions in-process.
+Antigravity Session Vault enforces strict autonomous quality assurance standards through a dual-layer verification mandate:
+- **Backend Invariant Tests (`tests/test_vault.py` - 26 tests)**: Mathematical conservation laws ($\sum \text{buckets} = \text{total}$), monotonicity laws (sessions can upgrade but never downgrade), online SQLite WAL backups, atomic rollback, path-traversal security verification, and detached subprocess lifecycle.
+- **Headless UI Tests (`tests/test_ui_apptest.py` - 10 tests)**: Streamlit's official `st.testing.v1.AppTest` framework simulating clicks, tab switches, segmented control toggling, sidebar button interactions, and responsive full-width layout verification in-process.
 
 Run the unified test suite:
 
@@ -226,7 +233,7 @@ python -m unittest discover tests -v
 ```
 
 ```text
-Ran 28 tests in ~15s
+Ran 36 tests in ~34s
 OK (0 failures, 0 errors)
 ```
 

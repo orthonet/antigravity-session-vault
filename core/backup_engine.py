@@ -21,7 +21,7 @@ from core.file_ops import copy_file_robust, backup_sqlite_db_safe, sync_director
 
 logger = logging.getLogger(__name__)
 
-def sync_live_to_backup() -> Dict[str, Any]:
+def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
     """
     Performs a hardened, incremental synchronization:
     1. Detects new or modified conversations in live Antigravity.
@@ -75,8 +75,8 @@ def sync_live_to_backup() -> Dict[str, Any]:
         cat_conn.execute("PRAGMA busy_timeout=10000;")
         cat_cur = cat_conn.cursor()
 
-        cat_cur.execute("SELECT conversation_id, last_modified_time, has_db_file, has_brain_folder FROM backed_up_conversations")
-        cat_map = {r[0]: (r[1], bool(r[2]), bool(r[3])) for r in cat_cur.fetchall()}
+        cat_cur.execute("SELECT conversation_id, last_modified_time, has_db_file, has_brain_folder, retention_status FROM backed_up_conversations")
+        cat_map = {r[0]: (r[1], bool(r[2]), bool(r[3]), r[4]) for r in cat_cur.fetchall()}
 
         for r in live_rows:
             row_dict = dict(zip(live_cols, r))
@@ -99,6 +99,7 @@ def sync_live_to_backup() -> Dict[str, Any]:
             cached = cat_map.get(cid)
             has_backup_db_cached = cached[1] if cached else False
             has_backup_brain_cached = cached[2] if cached else False
+            cached_ret = cached[3] if cached and len(cached) > 3 else None
 
             needs_sync = False
             if not cached:
@@ -139,17 +140,44 @@ def sync_live_to_backup() -> Dict[str, Any]:
                     has_backup_brain = True
 
                 category = classify_session(title, preview, step_count, is_pinned)
-                retention_status = "complete_active" if has_backup_db else "metadata_only_evicted"
-                is_evicted = 0 if has_live_db else 1
+                if has_live_db:
+                    retention_status = "complete_active"
+                    is_evicted = 0
+                elif cached_ret == "imported_from_offsite":
+                    retention_status = "imported_from_offsite"
+                    is_evicted = 1
+                elif has_backup_db:
+                    retention_status = "safeguarded_evicted"
+                    is_evicted = 1
+                else:
+                    retention_status = "metadata_only_evicted"
+                    is_evicted = 1
 
                 cat_cur.execute("""
-                INSERT OR REPLACE INTO backed_up_conversations (
+                INSERT INTO backed_up_conversations (
                     conversation_id, title, preview, step_count, last_modified_time,
                     last_user_input_time, workspace_uris, project_id, status,
                     category, retention_status, has_db_file, has_brain_folder,
                     is_pinned, is_evicted_from_live, first_backed_up_time,
                     last_synced_time, raw_summary
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    title = excluded.title,
+                    preview = excluded.preview,
+                    step_count = excluded.step_count,
+                    last_modified_time = excluded.last_modified_time,
+                    last_user_input_time = excluded.last_user_input_time,
+                    workspace_uris = excluded.workspace_uris,
+                    project_id = excluded.project_id,
+                    status = excluded.status,
+                    category = excluded.category,
+                    retention_status = excluded.retention_status,
+                    has_db_file = excluded.has_db_file,
+                    has_brain_folder = excluded.has_brain_folder,
+                    is_pinned = excluded.is_pinned,
+                    is_evicted_from_live = excluded.is_evicted_from_live,
+                    last_synced_time = excluded.last_synced_time,
+                    raw_summary = excluded.raw_summary
                 """, (
                     cid, title, preview, step_count, live_lmt,
                     row_dict.get("last_user_input_time", ""), ws, proj, status,
@@ -160,11 +188,15 @@ def sync_live_to_backup() -> Dict[str, Any]:
 
         # 4. Check for sessions that were live before but now evicted
         for cid, cached_val in cat_map.items():
-            last_lmt, had_db, had_brain = cached_val
+            last_lmt, had_db, had_brain = cached_val[:3]
             if had_db and cid not in live_db_files:
                 cat_cur.execute("""
                 UPDATE backed_up_conversations
-                SET is_evicted_from_live = 1
+                SET is_evicted_from_live = 1,
+                    retention_status = CASE 
+                        WHEN retention_status = 'complete_active' THEN 'safeguarded_evicted'
+                        ELSE retention_status 
+                    END
                 WHERE conversation_id = ?
                 """, (cid,))
 
@@ -172,21 +204,24 @@ def sync_live_to_backup() -> Dict[str, Any]:
     finally:
         cat_conn.close()
 
-    # 5. Update heartbeat file
-    DAEMON_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(DAEMON_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "last_heartbeat": now_utc,
-            "status": "active",
-            "last_synced_dbs": synced_dbs,
-            "last_synced_brains": synced_brains,
-            "errors": errors[:5] if errors else []
-        }, f, indent=2)
+    # 5. Vault Pin Sentry Protection: Auto-resurrect evicted pinned sessions & keep alive
+    pin_sentry_res = {}
+    if auto_protect_pinned:
+        try:
+            from core.pin_sentry import run_pin_sentry
+            pin_sentry_res = run_pin_sentry(
+                catalog_db_path=BACKUP_CATALOG_DB,
+                live_summaries_path=LIVE_SUMMARIES_DB,
+                live_conv_dir=LIVE_CONVERSATIONS_DIR
+            )
+        except Exception as pe:
+            errors.append(f"Pin Sentry execution notice: {pe}")
 
     return {
         "success": True,
         "synced_at": now_utc,
         "synced_dbs": synced_dbs,
         "synced_brains": synced_brains,
+        "pin_sentry": pin_sentry_res,
         "errors": errors
     }

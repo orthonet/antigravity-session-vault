@@ -21,7 +21,7 @@ from core.importer import scan_offsite_source, execute_import
 from core.backup_engine import sync_live_to_backup
 from core.search_engine import search_backup_conversations, highlight_snippet
 from core.file_ops import copy_file_robust, backup_sqlite_db_safe, sync_directory_tree, rmtree_robust
-from core.daemon import acquire_pid_lock, release_pid_lock, is_pid_running
+from core.daemon import acquire_pid_lock, release_pid_lock, is_pid_running, run_pin_sentry
 from core.restorer import (
     restore_conversation,
     validate_conversation_id,
@@ -41,6 +41,15 @@ class TestAntigravityVault(unittest.TestCase):
         self.assertGreater(metrics["total"], 2500, "Total catalog records should exceed 2500")
         self.assertGreaterEqual(metrics["metadata_only_evicted"] + metrics.get("imported_from_offsite", 0), 2000, "Evicted + imported records should exceed 2000")
         self.assertGreaterEqual(metrics["pinned"], 10, "Should have >= 10 pinned records")
+        self.assertIn("workspaces", metrics)
+        self.assertIsInstance(metrics["workspaces"], int)
+        self.assertGreater(metrics["workspaces"], 0, "Discovered workspaces should be > 0")
+        # Invariant: Conservation law across 4 distinct retention categories
+        self.assertEqual(
+            metrics["total"],
+            metrics["complete_active"] + metrics.get("safeguarded_evicted", 0) + metrics.get("imported_from_offsite", 0) + metrics["metadata_only_evicted"],
+            "Total catalogued must equal sum of all four distinct retention states"
+        )
 
     def test_02_classifier(self):
         """Test classifier categorizes queue tasks vs interactive sessions."""
@@ -118,8 +127,16 @@ class TestAntigravityVault(unittest.TestCase):
         ret_counts = self.catalog.get_retention_counts()
         self.assertIn("total", ret_counts)
         self.assertIn("complete_active", ret_counts)
+        self.assertIn("safeguarded_evicted", ret_counts)
         self.assertIn("metadata_only_evicted", ret_counts)
-        self.assertEqual(ret_counts["total"], ret_counts.get("complete_active", 0) + ret_counts.get("metadata_only_evicted", 0) + ret_counts.get("imported_from_offsite", 0))
+        self.assertIn("imported_from_offsite", ret_counts)
+        self.assertEqual(
+            ret_counts["total"],
+            ret_counts.get("complete_active", 0) +
+            ret_counts.get("safeguarded_evicted", 0) +
+            ret_counts.get("metadata_only_evicted", 0) +
+            ret_counts.get("imported_from_offsite", 0)
+        )
 
         cat_counts = self.catalog.get_category_counts()
         self.assertIn("total", cat_counts)
@@ -361,12 +378,23 @@ class TestAntigravityVault(unittest.TestCase):
                 pass
 
     def test_16_daemon_pid_lock(self):
-        """Test daemon PID lock acquisition and release."""
+        """Test daemon PID lock acquisition and release with hermetically isolated PID file."""
         self.assertTrue(is_pid_running(os.getpid()))
         self.assertFalse(is_pid_running(99999999))
-        acquired = acquire_pid_lock()
-        self.assertTrue(acquired)
-        release_pid_lock()
+
+        from unittest.mock import patch
+        test_pid_file = Path(__file__).parent / "temp_daemon.pid"
+        try:
+            with patch("core.daemon.DAEMON_PID_FILE", test_pid_file):
+                test_pid_file.unlink(missing_ok=True)
+                acquired = acquire_pid_lock()
+                self.assertTrue(acquired)
+                self.assertTrue(test_pid_file.exists())
+                self.assertEqual(int(test_pid_file.read_text(encoding="utf-8").strip()), os.getpid())
+                release_pid_lock()
+                self.assertFalse(test_pid_file.exists())
+        finally:
+            test_pid_file.unlink(missing_ok=True)
 
     def test_17_importer_reconciliation_and_actionable_filtering(self):
         """Test scanner 4-tier reconciliation and actionable-first sorting on real backup data."""
@@ -687,6 +715,310 @@ class TestAntigravityVault(unittest.TestCase):
 
         finally:
             rmtree_robust(test_dir)
+
+    def test_22_safeguarded_evicted_taxonomy_and_conservation_law(self):
+        """Verify that safeguarded_evicted taxonomy strictly partitions live vs vault-only sessions."""
+        metrics = self.catalog.get_summary_metrics()
+        
+        # 1. Conservation law must hold strictly
+        self.assertEqual(
+            metrics["total"],
+            metrics["complete_active"] + metrics["safeguarded_evicted"] + metrics["imported_from_offsite"] + metrics["metadata_only_evicted"]
+        )
+
+        # 2. Complete active must strictly match un-evicted live DB count
+        active_sessions = self.catalog.query_conversations(retention_filter="complete_active", limit=50)
+        self.assertGreater(len(active_sessions), 0)
+        for s in active_sessions:
+            self.assertEqual(s["is_evicted_from_live"], 0, "complete_active sessions must have is_evicted_from_live = 0")
+            self.assertEqual(s["retention_status"], "complete_active")
+
+        # 3. Safeguarded evicted must have physical backup DB but is_evicted_from_live = 1
+        safeguarded = self.catalog.query_conversations(retention_filter="safeguarded_evicted", limit=50)
+        self.assertGreater(len(safeguarded), 0, "Should have safeguarded evicted sessions")
+        for s in safeguarded:
+            self.assertEqual(s["is_evicted_from_live"], 1, "safeguarded_evicted sessions must have is_evicted_from_live = 1")
+            self.assertEqual(s["has_db_file"], 1, "safeguarded_evicted sessions must possess physical backup DB")
+            self.assertEqual(s["retention_status"], "safeguarded_evicted")
+
+    def test_23_pin_sentry_keep_alive_and_auto_resurrection(self):
+        """Verify Pin Sentry performs both preventive keep-alive touches and self-healing auto-resurrections."""
+        test_dir = Path(__file__).parent / "temp_pin_sentry_test"
+        rmtree_robust(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+
+        mock_backup_conv = test_dir / "backup_conversations"
+        mock_backup_brain = test_dir / "backup_brain"
+        mock_backup_cat = test_dir / "backup_catalog.db"
+        mock_live_conv = test_dir / "live_conversations"
+        mock_live_brain = test_dir / "live_brain"
+        mock_live_sum = test_dir / "live_summaries.db"
+
+        for p in [mock_backup_conv, mock_backup_brain, mock_live_conv, mock_live_brain]:
+            p.mkdir(parents=True, exist_ok=True)
+
+        cat_mgr = CatalogManager(db_path=mock_backup_cat)
+        cid_active = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
+        cid_evicted = "ffff2222-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        # Create dummy trajectory databases
+        for cid in [cid_active, cid_evicted]:
+            src_db = mock_backup_conv / f"{cid}.db"
+            with sqlite3.connect(src_db) as conn:
+                conn.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY);")
+                conn.commit()
+
+        # Place cid_active in live conversations directory with an old timestamp
+        live_active_db = mock_live_conv / f"{cid_active}.db"
+        copy_file_robust(mock_backup_conv / f"{cid_active}.db", live_active_db)
+
+        # Initialize mock live_summaries.db
+        with sqlite3.connect(mock_live_sum) as conn:
+            conn.execute("""
+            CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT,
+                preview TEXT,
+                step_count INTEGER,
+                last_modified_time TEXT,
+                workspace_uris TEXT,
+                status TEXT,
+                last_user_input_time TEXT,
+                app_data_dir TEXT
+            );
+            """)
+            # Insert cid_active with an old timestamp (e.g., 48 hours ago)
+            conn.execute("""
+            INSERT INTO conversation_summaries (
+                conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, last_user_input_time, app_data_dir
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cid_active, "Active Strategy Session", "Preview", 10,
+                "2026-10-01 10:00:00.000000+00:00", '[""]', "CASCADE_RUN_STATUS_IDLE",
+                "2026-10-01 10:00:00.000000+00:00", "antigravity"
+            ))
+            # Insert 400 dummy newer sessions to simulate rank #401
+            for i in range(400):
+                conn.execute("""
+                INSERT INTO conversation_summaries (
+                    conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, last_user_input_time, app_data_dir
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    f"dummy-{i:04d}", f"Queue Job {i}", "", 1,
+                    f"2026-10-02 {i//60:02d}:{i%60:02d}:00.000000+00:00", '[""]', "CASCADE_RUN_STATUS_IDLE",
+                    f"2026-10-02 {i//60:02d}:{i%60:02d}:00.000000+00:00", "antigravity"
+                ))
+            conn.commit()
+
+        # Seed mock backup_catalog.db
+        with sqlite3.connect(mock_backup_cat) as conn:
+            # cid_active: marked is_pinned=1, is_evicted=0
+            conn.execute("""
+            INSERT INTO backed_up_conversations (
+                conversation_id, title, preview, step_count, last_modified_time,
+                retention_status, has_db_file, has_brain_folder, is_pinned, is_evicted_from_live, workspace_uris
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cid_active, "Active Strategy Session", "Preview", 10,
+                "2026-10-01 10:00:00.000000+00:00", "complete_active", 1, 0, 1, 0, '[""]'
+            ))
+            # cid_evicted: marked is_pinned=1, is_evicted=1 (evicted from live)
+            conn.execute("""
+            INSERT INTO backed_up_conversations (
+                conversation_id, title, preview, step_count, last_modified_time,
+                retention_status, has_db_file, has_brain_folder, is_pinned, is_evicted_from_live, workspace_uris
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cid_evicted, "Evicted Strategy Session", "Preview", 25,
+                "2026-09-20 12:00:00.000000+00:00", "safeguarded_evicted", 1, 0, 1, 1, '[""]'
+            ))
+            conn.commit()
+
+        from unittest.mock import patch
+        try:
+            with patch("core.restorer.BACKUP_CONVERSATIONS_DIR", mock_backup_conv), \
+                 patch("core.restorer.BACKUP_BRAIN_DIR", mock_backup_brain), \
+                 patch("core.restorer.BACKUP_ANNOTATIONS_DIR", test_dir / "ann_src"), \
+                 patch("core.restorer.BACKUP_CATALOG_DB", mock_backup_cat), \
+                 patch("core.restorer.LIVE_CONVERSATIONS_DIR", mock_live_conv), \
+                 patch("core.restorer.LIVE_BRAIN_DIR", mock_live_brain), \
+                 patch("core.restorer.LIVE_ANNOTATIONS_DIR", test_dir / "ann_dst"), \
+                 patch("core.restorer.LIVE_SUMMARIES_DB", mock_live_sum):
+
+                # Run Pin Sentry
+                sentry_res = run_pin_sentry(
+                    max_rank_threshold=350,
+                    max_age_hours=12.0,
+                    catalog_db_path=mock_backup_cat,
+                    live_summaries_path=mock_live_sum,
+                    live_conv_dir=mock_live_conv
+                )
+
+                self.assertEqual(sentry_res["protected_count"], 2)
+                self.assertEqual(sentry_res["refreshed"], 1, "Should have refreshed cid_active keep-alive timestamp")
+                self.assertEqual(sentry_res["auto_resurrected"], 1, "Should have auto-resurrected cid_evicted into live")
+
+                # Verify cid_active timestamp was bumped in live_summaries.db
+                with sqlite3.connect(mock_live_sum) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT last_modified_time FROM conversation_summaries WHERE conversation_id = ?", (cid_active,))
+                    new_lmt = cur.fetchone()[0]
+                    self.assertIn("2026-10-03", new_lmt, "Active session timestamp must be refreshed to today")
+
+                # Verify cid_evicted was resurrected into mock_live_conv
+                resurrected_live_db = mock_live_conv / f"{cid_evicted}.db"
+                self.assertTrue(resurrected_live_db.exists(), "Evicted pinned session must be physically restored into live conversations")
+
+                # Verify cid_evicted status upgraded in catalog
+                with sqlite3.connect(mock_backup_cat) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT retention_status, is_evicted_from_live FROM backed_up_conversations WHERE conversation_id = ?", (cid_evicted,))
+                    ret_stat, is_ev = cur.fetchone()
+                    self.assertEqual(ret_stat, "complete_active")
+                    self.assertEqual(is_ev, 0)
+
+        finally:
+            rmtree_robust(test_dir)
+
+    def test_24_sync_live_to_backup_auto_protects_pinned(self):
+        """Verify that sync_live_to_backup(auto_protect_pinned=True) auto-resurrects evicted pinned sessions."""
+        test_dir = Path("D:/test_agy_sync_protect_pinned")
+        if test_dir.exists():
+            rmtree_robust(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            mock_live_sum = test_dir / "conversation_summaries.db"
+            mock_live_conv = test_dir / "live_conv"
+            mock_live_brain = test_dir / "live_brain"
+            mock_backup_conv = test_dir / "backup_conv"
+            mock_backup_brain = test_dir / "backup_brain"
+            mock_backup_cat = test_dir / "backup_catalog.db"
+
+            mock_live_conv.mkdir(parents=True, exist_ok=True)
+            mock_live_brain.mkdir(parents=True, exist_ok=True)
+            mock_backup_conv.mkdir(parents=True, exist_ok=True)
+            mock_backup_brain.mkdir(parents=True, exist_ok=True)
+
+            CatalogManager(mock_backup_cat)._init_db()
+
+            cid_pinned = "c8901234-5678-4abc-def0-123456789abc"
+            # Populate in backup
+            b_db = mock_backup_conv / f"{cid_pinned}.db"
+            with sqlite3.connect(b_db) as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT, value TEXT);")
+                conn.execute("INSERT INTO metadata VALUES ('test', 'pinned');")
+
+            # Insert as evicted pinned in catalog
+            with sqlite3.connect(mock_backup_cat) as conn:
+                conn.execute("""
+                INSERT INTO backed_up_conversations (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    retention_status, has_db_file, has_brain_folder, is_pinned, is_evicted_from_live, workspace_uris
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    cid_pinned, "Pinned Evicted Session", "Preview", 12,
+                    "2026-09-15 12:00:00.000000+00:00", "safeguarded_evicted", 1, 0, 1, 1, '[""]'
+                ))
+                conn.commit()
+
+            # Init mock_live_sum
+            with sqlite3.connect(mock_live_sum) as conn:
+                conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    last_modified_time TEXT,
+                    workspace_uris TEXT,
+                    step_count INTEGER,
+                    preview TEXT
+                );
+                """)
+                conn.commit()
+
+            from unittest.mock import patch
+            with patch("core.backup_engine.LIVE_SUMMARIES_DB", mock_live_sum), \
+                 patch("core.backup_engine.LIVE_CONVERSATIONS_DIR", mock_live_conv), \
+                 patch("core.backup_engine.LIVE_BRAIN_DIR", mock_live_brain), \
+                 patch("core.backup_engine.BACKUP_CONVERSATIONS_DIR", mock_backup_conv), \
+                 patch("core.backup_engine.BACKUP_BRAIN_DIR", mock_backup_brain), \
+                 patch("core.backup_engine.BACKUP_CATALOG_DB", mock_backup_cat), \
+                 patch("core.pin_sentry.BACKUP_CATALOG_DB", mock_backup_cat), \
+                 patch("core.pin_sentry.LIVE_SUMMARIES_DB", mock_live_sum), \
+                 patch("core.pin_sentry.LIVE_CONVERSATIONS_DIR", mock_live_conv), \
+                 patch("core.restorer.BACKUP_CONVERSATIONS_DIR", mock_backup_conv), \
+                 patch("core.restorer.BACKUP_BRAIN_DIR", mock_backup_brain), \
+                 patch("core.restorer.BACKUP_CATALOG_DB", mock_backup_cat), \
+                 patch("core.restorer.LIVE_CONVERSATIONS_DIR", mock_live_conv), \
+                 patch("core.restorer.LIVE_BRAIN_DIR", mock_live_brain), \
+                 patch("core.restorer.LIVE_SUMMARIES_DB", mock_live_sum):
+
+                res = sync_live_to_backup(auto_protect_pinned=True)
+                self.assertTrue(res.get("success"))
+                self.assertIn("pin_sentry", res)
+                self.assertEqual(res["pin_sentry"]["auto_resurrected"], 1)
+
+                # Verify resurrected into live
+                self.assertTrue((mock_live_conv / f"{cid_pinned}.db").exists())
+
+                # Verify upgraded in catalog
+                with sqlite3.connect(mock_backup_cat) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT retention_status, is_evicted_from_live FROM backed_up_conversations WHERE conversation_id = ?", (cid_pinned,))
+                    ret, is_ev = cur.fetchone()
+                    self.assertEqual(ret, "complete_active")
+                    self.assertEqual(is_ev, 0)
+        finally:
+            rmtree_robust(test_dir)
+
+    def test_25_daemon_live_status_reporting(self):
+        """Verify get_daemon_live_status accurately reflects process state without false positives."""
+        from core.daemon import get_daemon_live_status
+        status, detail, hb = get_daemon_live_status()
+        self.assertIsInstance(status, str)
+        self.assertIsInstance(detail, str)
+        self.assertIsInstance(hb, dict)
+
+    def test_26_daemon_subprocess_spawning_and_survival(self):
+        """Verify detached background daemon subprocess spawns cleanly, survives import, and stops cleanly."""
+        from core.daemon import (
+            start_daemon_process,
+            stop_daemon_process,
+            is_pid_running,
+            get_daemon_live_status
+        )
+        import time
+
+        # Ensure no prior daemon is lingering
+        stop_daemon_process()
+        time.sleep(0.5)
+
+        # Launch detached daemon subprocess with 10s interval
+        success, res = start_daemon_process(interval=10)
+        self.assertTrue(success, f"start_daemon_process failed: {res}")
+        self.assertIsInstance(res, int)
+        self.assertGreater(res, 0)
+        daemon_pid = res
+
+        try:
+            # Verify PID is actively running at OS level
+            self.assertTrue(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should be active")
+
+            # Check status reporting reflects active daemon
+            status, detail, hb = get_daemon_live_status()
+            self.assertTrue(status.startswith("🟢"), f"Expected 🟢 Active status, got: {status}")
+
+            # Verify idempotency: calling start_daemon_process again returns the same running PID
+            success_again, res_again = start_daemon_process(interval=10)
+            self.assertTrue(success_again)
+            self.assertEqual(res_again, daemon_pid)
+        finally:
+            # Cleanly terminate the daemon
+            stopped = stop_daemon_process()
+            self.assertTrue(stopped)
+            time.sleep(0.5)
+            self.assertFalse(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should have stopped")
+            status_after, _, _ = get_daemon_live_status()
+            self.assertEqual(status_after, "⚪ Inactive")
 
 if __name__ == "__main__":
     unittest.main()

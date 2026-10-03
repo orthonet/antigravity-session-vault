@@ -23,6 +23,8 @@ from core.importer import scan_offsite_source, execute_import
 from core.backup_engine import sync_live_to_backup
 from core.classifier import format_display_title
 from core.search_engine import search_backup_conversations
+from core.daemon import get_daemon_live_status, start_daemon_process, stop_daemon_process
+from core.pin_sentry import run_pin_sentry
 
 st.set_page_config(
     page_title="Antigravity Session Vault",
@@ -418,7 +420,24 @@ st.markdown("""
         border: 1px solid var(--vault-border);
         box-shadow: 0 1px 3px var(--vault-shadow);
     }
-    .badge-complete {
+    .badge-complete, .badge-active {
+        background-color: var(--vault-badge-complete-bg);
+        color: var(--vault-badge-complete-text);
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.8rem;
+    }
+    .badge-safeguarded {
+        background-color: rgba(16, 185, 129, 0.15);
+        color: #10b981;
+        border: 1px solid rgba(16, 185, 129, 0.4);
+        padding: 2px 7px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.8rem;
+    }
+    .badge-offsite {
         background-color: var(--vault-badge-complete-bg);
         color: var(--vault-badge-complete-text);
         padding: 3px 8px;
@@ -671,7 +690,18 @@ def execute_restore_callback(cid: str, target_workspace: Optional[str] = None):
 
 def toggle_pinned_callback(cid: str, current_pinned: bool):
     """Callback executed before rerun to toggle pinned status without widget lifecycle conflict."""
-    catalog.update_pinned_status(cid, not current_pinned)
+    new_pinned = not current_pinned
+    catalog.update_pinned_status(cid, new_pinned)
+    if new_pinned:
+        # Check if conversation is evicted or missing from live, and auto-resurrect immediately
+        conv = catalog.get_conversation_by_id(cid)
+        if conv and (conv.get("is_evicted_from_live") or conv.get("retention_status") != "complete_active"):
+            if conv.get("has_db_file"):
+                try:
+                    res = restore_conversation(cid, overwrite_live=True)
+                    st.session_state["restore_action_feedback"] = res
+                except Exception as e:
+                    st.session_state["restore_action_feedback"] = {"success": False, "error": str(e), "conversation_id": cid}
 
 def format_local_timestamp(iso_str: str) -> str:
     """Converts a raw UTC ISO timestamp from Antigravity DB to local time with timezone."""
@@ -698,37 +728,88 @@ with st.sidebar:
     st.title("Session Vault")
     st.caption("Bypassing Antigravity's Rolling Eviction Cap")
 
-    # Check Daemon Heartbeat
-    daemon_status = "Inactive"
-    heartbeat_detail = "Never started"
-    if DAEMON_HEARTBEAT_FILE.exists():
-        try:
-            with open(DAEMON_HEARTBEAT_FILE, "r", encoding="utf-8") as f:
-                hb = json.load(f)
-                hb_time = hb.get("last_heartbeat", "")
-                if hb_time:
-                    dt = datetime.fromisoformat(hb_time)
-                    age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
-                    if age_seconds < 120 and hb.get("status") == "active":
-                        daemon_status = "🟢 Active"
-                        heartbeat_detail = f"Synced {int(age_seconds)}s ago"
-                    else:
-                        daemon_status = "🟡 Idle"
-                        heartbeat_detail = f"Last seen {int(age_seconds // 60)}m ago"
-        except Exception:
-            pass
+    @st.fragment(run_every=15)
+    def render_sidebar_daemon_controls():
+        # Check Daemon Live Status via Process ID verification
+        daemon_status, heartbeat_detail, hb = get_daemon_live_status()
 
-    st.markdown(f"**Sync Daemon**: {daemon_status}")
-    st.caption(f"Status: {heartbeat_detail}")
+        st.markdown(f"**Sync Daemon**: {daemon_status}")
+        st.caption(f"Status: {heartbeat_detail}")
 
-    if st.button("🔄 Sync Live Now", width="stretch"):
-        with st.spinner("Syncing live Antigravity sessions..."):
-            res = sync_live_to_backup()
-            if res.get("success"):
-                st.success(f"Synced {res.get('synced_dbs')} DBs & {res.get('synced_brains')} brains!")
-                st.rerun()
+        metrics = catalog.get_summary_metrics()
+        pinned_total = metrics.get('pinned', 11)
+        st.caption(f"🛡️ **Pin Sentry**: Active ({pinned_total} Protected)")
+
+        # Sidebar Control Buttons
+        col_d1, col_d2 = st.columns([1, 1.3])
+        stop_clicked = False
+        start_clicked = False
+        with col_d1:
+            if daemon_status.startswith("🟢"):
+                stop_clicked = st.button("⏹️ Stop", key="sidebar_stop_daemon_btn", width="stretch", help="Stop background continuous sync daemon")
             else:
-                st.error(res.get("error"))
+                start_clicked = st.button("▶️ Start", key="sidebar_start_daemon_btn", width="stretch", help="Start background continuous sync daemon")
+        with col_d2:
+            sync_clicked = st.button("🔄 Sync Live Now", width="stretch", help="Sync live sessions to vault & run Pin Sentry protection")
+
+        # Full-width action handling & intermediate progress (outside narrow columns)
+        if stop_clicked:
+            ok = stop_daemon_process()
+            if ok:
+                st.session_state["sidebar_action_feedback"] = {"type": "info", "message": "Sync daemon stopped cleanly."}
+                st.toast("Sync daemon stopped", icon="⏹️")
+            else:
+                st.session_state["sidebar_action_feedback"] = {"type": "error", "message": "Error stopping sync daemon."}
+            st.rerun()
+
+        if start_clicked:
+            ok, res = start_daemon_process(30)
+            if ok:
+                st.session_state["sidebar_action_feedback"] = {"type": "success", "message": f"Sync daemon started (PID {res})."}
+                st.toast(f"Sync daemon active (PID {res})", icon="🟢")
+            else:
+                st.session_state["sidebar_action_feedback"] = {"type": "error", "message": f"Failed to start daemon: {res}"}
+                st.toast("Failed to start daemon", icon="❌")
+            st.rerun()
+
+        if sync_clicked:
+            with st.spinner("Syncing sessions & running Pin Sentry..."):
+                res = sync_live_to_backup(auto_protect_pinned=True)
+                if res.get("success"):
+                    dbs = res.get('synced_dbs', 0)
+                    brains = res.get('synced_brains', 0)
+                    ps = res.get("pin_sentry", {})
+                    resurrected = ps.get("auto_resurrected", 0)
+                    refreshed = ps.get("refreshed", 0)
+
+                    msg = f"Synced {dbs} DBs & {brains} brains."
+                    if resurrected > 0:
+                        msg += f" 🛡️ Resurrected {resurrected} pinned sessions to Live!"
+                    elif refreshed > 0:
+                        msg += f" 🛡️ Refreshed {refreshed} pinned keep-alive timestamps."
+                    else:
+                        msg += f" (All {pinned_total} pinned sessions active in AGY)"
+                    st.session_state["sidebar_action_feedback"] = {"type": "success", "message": msg}
+                    st.toast(msg, icon="✅")
+                    st.rerun()
+                else:
+                    err_msg = res.get("error", "Unknown sync error")
+                    st.session_state["sidebar_action_feedback"] = {"type": "error", "message": f"Sync failed: {err_msg}"}
+                    st.rerun()
+
+        # Full-width feedback banner underneath both buttons in sidebar
+        if "sidebar_action_feedback" in st.session_state:
+            fb = st.session_state.pop("sidebar_action_feedback")
+            fb_type = fb.get("type", "info")
+            fb_msg = fb.get("message", "")
+            if fb_type == "success":
+                st.success(fb_msg)
+            elif fb_type == "error":
+                st.error(fb_msg)
+            else:
+                st.info(fb_msg)
+
+    render_sidebar_daemon_controls()
 
     st.divider()
 
@@ -739,11 +820,13 @@ with st.sidebar:
 
     col_m1, col_m2 = st.columns(2)
     with col_m1:
-        st.metric("💾 Active", f"{metrics['complete_active']:,}")
-        st.metric("📋 Evicted", f"{metrics['metadata_only_evicted']:,}")
-    with col_m2:
-        st.metric("📥 Offsite", f"{metrics.get('imported_from_offsite', 0):,}")
+        st.metric("🟢 Active in AGY", f"{metrics['complete_active']:,}")
+        st.metric("📋 Metadata Only", f"{metrics['metadata_only_evicted']:,}")
         st.metric("⭐ Pinned", f"{metrics['pinned']:,}")
+    with col_m2:
+        st.metric("🛡️ Safeguarded", f"{metrics.get('safeguarded_evicted', 0):,}")
+        st.metric("📥 Offsite Restored", f"{metrics.get('imported_from_offsite', 0):,}")
+        st.metric("💼 Workspaces", f"{metrics.get('workspaces', 0):,}")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.divider()
@@ -794,13 +877,14 @@ with tab_explore:
     with col_ret:
         ret_filter = st.selectbox(
             "Retention Status",
-            ["All", "complete_active", "metadata_only_evicted", "imported_from_offsite"],
+            ["All", "complete_active", "safeguarded_evicted", "imported_from_offsite", "metadata_only_evicted"],
             key="explorer_ret_filter",
             format_func=lambda x: {
                 "All": f"All Retention States ({total_db_count:,})",
-                "complete_active": f"💾 Complete Active ({ret_counts.get('complete_active', 0):,})",
-                "metadata_only_evicted": f"📋 Metadata Only (Evicted) ({ret_counts.get('metadata_only_evicted', 0):,})",
-                "imported_from_offsite": f"📥 Imported from Offsite ({ret_counts.get('imported_from_offsite', 0):,})"
+                "complete_active": f"🟢 Active in Antigravity ({ret_counts.get('complete_active', 0):,})",
+                "safeguarded_evicted": f"🛡️ Safeguarded in Vault ({ret_counts.get('safeguarded_evicted', 0):,})",
+                "imported_from_offsite": f"📥 Recovered from Offsite ({ret_counts.get('imported_from_offsite', 0):,})",
+                "metadata_only_evicted": f"📋 Metadata Only (No Backup) ({ret_counts.get('metadata_only_evicted', 0):,})"
             }.get(x, x)
         )
 
@@ -904,11 +988,13 @@ with tab_explore:
                 # Badge row
                 badges_html = ""
                 if ret_status == "complete_active":
-                    badges_html += '<span class="badge-complete">💾 Complete Active</span> '
+                    badges_html += '<span class="badge-active">🟢 Active in AGY</span> '
+                elif ret_status == "safeguarded_evicted":
+                    badges_html += '<span class="badge-safeguarded">🛡️ Safeguarded (Evicted)</span> '
                 elif ret_status == "imported_from_offsite":
-                    badges_html += '<span class="badge-complete">📥 Offsite Restored</span> '
+                    badges_html += '<span class="badge-offsite">📥 Offsite Restored</span> '
                 else:
-                    badges_html += '<span class="badge-evicted">📋 Metadata Only (Evicted)</span> '
+                    badges_html += '<span class="badge-evicted">📋 Metadata Only</span> '
 
                 if is_pinned:
                     badges_html += '<span class="badge-pinned">⭐ Pinned</span> '
@@ -945,7 +1031,7 @@ with tab_explore:
                 with col_btn2:
                     if not is_evicted and ret_status == "complete_active":
                         st.button(
-                            "🟢 Active in Antigravity",
+                            "🟢 Active in AGY",
                             key=f"act_{cid}",
                             width="stretch",
                             disabled=True,
@@ -1098,7 +1184,7 @@ with tab_viewer:
             with c_act1:
                 if not is_evicted and ret_status == "complete_active":
                     st.button(
-                        "🟢 Active in Antigravity",
+                        "🟢 Active in AGY",
                         key="viewer_act_btn",
                         width="stretch",
                         disabled=True,
@@ -1369,9 +1455,11 @@ with tab_search:
                         # Badges
                         b_html = ""
                         if ret_status == "complete_active":
-                            b_html += '<span class="badge-complete">💾 Complete Active</span> '
+                            b_html += '<span class="badge-active">🟢 Active in AGY</span> '
+                        elif ret_status == "safeguarded_evicted":
+                            b_html += '<span class="badge-safeguarded">🛡️ Safeguarded (Evicted)</span> '
                         elif ret_status == "imported_from_offsite":
-                            b_html += '<span class="badge-complete">📥 Offsite Restored</span> '
+                            b_html += '<span class="badge-offsite">📥 Offsite Restored</span> '
                         else:
                             b_html += '<span class="badge-evicted">📋 Metadata Only</span> '
 
@@ -1718,12 +1806,73 @@ with tab_settings:
 
     with col_h2:
         st.markdown("### 🔄 Daemon Service Setup")
+        d_status, d_detail, _ = get_daemon_live_status()
+        st.write(f"**Daemon Status**: {d_status} &nbsp;(`{d_detail}`)")
+
+        col_act1, col_act2 = st.columns(2)
+        with col_act1:
+            if d_status.startswith("🟢"):
+                if st.button("⏹️ Stop Daemon Process", key="tab5_stop_daemon_btn", width="stretch"):
+                    stop_daemon_process()
+                    st.rerun()
+            else:
+                if st.button("▶️ Start Background Daemon", key="tab5_start_daemon_btn", width="stretch"):
+                    ok, res = start_daemon_process(30)
+                    if not ok:
+                        st.error(f"Failed to start daemon: {res}")
+                    else:
+                        st.rerun()
+        with col_act2:
+            if st.button("🔄 Restart Daemon", key="tab5_restart_daemon_btn", width="stretch"):
+                stop_daemon_process()
+                time.sleep(0.5)
+                ok, res = start_daemon_process(30)
+                if not ok:
+                    st.error(f"Failed to restart daemon: {res}")
+                else:
+                    st.rerun()
+
+        st.caption("The daemon runs autonomously every 30s in the background, executing continuous backup sweeps and Pin Sentry defense.")
+
+    st.divider()
+
+    st.markdown("### 🛡️ Vault Pin Sentry (Anti-Re-Eviction Defense)")
+    col_ps1, col_ps2 = st.columns([2, 1.2])
+    with col_ps1:
         st.markdown("""
-        To keep your conversations continuously protected 24/7 without opening this dashboard,
-        you can run the background ingestion daemon in a terminal or as a Windows background task:
+        **Continuous Pinned Session Immunity**:
+        Antigravity's internal language server process evicts sessions beyond ~500 based purely on `last_modified_time`,
+        ignoring the `pinned` flag. In environments with autonomous queue tasks, 100–140 sessions are generated daily,
+        causing earlier pinned conversations to be purged every 3.5 days.
+        
+        The **Vault Pin Sentry** provides dual-layer immunity:
+        1. **Preventive Keep-Alive**: Automatically refreshes the timestamp and file metadata of active pinned sessions before they sink past rank #350.
+        2. **Self-Healing Auto-Resurrection**: Instantly detects if Antigravity has purged a pinned session and restores its trajectory `.db` and `brain/` folder from the Vault.
         """)
-        st.code(f"python {Path('core/daemon.py').resolve()}", language="bash")
-        st.caption("The daemon polls every 30 seconds, capturing new and modified sessions automatically.")
+    with col_ps2:
+        pinned_count = metrics.get('pinned', 11)
+        with sqlite3.connect(BACKUP_CATALOG_DB) as c_conn:
+            c_cur = c_conn.cursor()
+            c_cur.execute("SELECT COUNT(*) FROM backed_up_conversations WHERE is_pinned = 1 AND is_evicted_from_live = 0 AND retention_status = 'complete_active'")
+            pinned_live_count = c_cur.fetchone()[0]
+
+        st.metric("⭐ Protected Pinned Sessions", f"{pinned_count}")
+        st.metric("🟢 Active in Antigravity", f"{pinned_live_count} / {pinned_count}")
+        if st.button("🛡️ Run Pin Sentry Protection Now", key="btn_run_sentry_now", width="stretch"):
+            with st.spinner("Executing Pin Sentry protection..."):
+                s_res = run_pin_sentry()
+                resurrected = s_res.get("auto_resurrected", 0)
+                refreshed = s_res.get("refreshed", 0)
+                msg = f"🛡️ Pin Sentry verified {s_res.get('protected_count', 0)} pinned sessions!"
+                if resurrected > 0:
+                    msg += f" Auto-resurrected {resurrected} to Live."
+                elif refreshed > 0:
+                    msg += f" Refreshed {refreshed} keep-alive timestamps."
+                else:
+                    msg += " All pinned sessions are active and healthy."
+                st.toast(msg, icon="✅")
+                st.success(msg)
+                st.rerun()
 
     st.divider()
     st.markdown("### 📤 Export Catalog Data")

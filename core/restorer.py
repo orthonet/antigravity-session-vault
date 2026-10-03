@@ -2,6 +2,7 @@ import sqlite3
 import re
 import json
 import time
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -235,7 +236,9 @@ def restore_conversation(
         cat_data = dict(zip(cols, row))
 
     # 4. Prepare parameters
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    now_native = now_utc.strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
     if target_workspace_uri:
         ws_uri = normalize_workspace_uri(target_workspace_uri)
     else:
@@ -249,7 +252,7 @@ def restore_conversation(
         "title": cat_data.get("title", ""),
         "preview": cat_data.get("preview", ""),
         "step_count": step_count,
-        "last_modified_time": now_iso,
+        "last_modified_time": now_native,
         "workspace_uris": ws_uri,
         "status": "CASCADE_RUN_STATUS_IDLE",
         "source": "",
@@ -261,7 +264,7 @@ def restore_conversation(
         "winning_conversation_id": "",
         "not_fully_idle": 0,
         "killed": 0,
-        "last_user_input_time": now_iso,
+        "last_user_input_time": now_native,
         "last_user_input_step_index": last_step_idx,
         "app_data_dir": "antigravity",
         "raw_summary": cat_data.get("raw_summary", None),
@@ -318,12 +321,19 @@ def restore_conversation(
                 ann_dst.parent.mkdir(parents=True, exist_ok=True)
                 copy_file_robust(ann_src, ann_dst)
 
+            # Touch live db file mtime to current time to align filesystem metadata
+            try:
+                current_ts = now_utc.timestamp()
+                os.utime(conv_db_dst, (current_ts, current_ts))
+            except Exception:
+                pass
+
         # 6. Insert into live conversation_summaries.db with retry
         _insert_live_summary(LIVE_SUMMARIES_DB, insert_dict)
 
         # 7. Update backup catalog immediately
-        cat_mgr = catalog_manager or CatalogManager()
-        cat_mgr.record_restored(cid, now_iso, ws_uri)
+        cat_mgr = catalog_manager or CatalogManager(BACKUP_CATALOG_DB)
+        cat_mgr.record_restored(cid, now_native, ws_uri)
 
     except Exception as e:
         # Atomic rollback: remove newly created files and directories
