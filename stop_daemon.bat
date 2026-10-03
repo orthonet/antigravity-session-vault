@@ -1,0 +1,6 @@
+@echo off
+title Stopping Antigravity Backup Sync Daemon...
+echo Stopping background sync daemon...
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'core[\\/]daemon\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Host ('Terminated daemon PID ' + $_.ProcessId) }"
+echo Sync daemon stopped.
+timeout /t 2 >nul

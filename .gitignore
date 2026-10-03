@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches and build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Dependencies and virtual environments
+node_modules/
+venv/
+.venv/
+vendor/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Secret and configuration files
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Operating System metadata
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor and IDE metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# Antigravity runtime, daemon & transient artifacts
+.antigravity/cache/
+.antigravity/sessions/
+*.tmp
+scratch/
+daemon.pid
+tests/temp_*/
+
+# SQLite transient WAL and journal files
+*.db-wal
+*.db-shm
+*.db-journal
