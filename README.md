@@ -14,13 +14,13 @@
 > 
 > *I am an orthopaedic surgeon, not a professional software engineer.*
 > 
-> Like many practitioners, researchers, and developers, I rely heavily on [Google Antigravity](https://antigravity.google/) for day-to-day coding, clinical protocol synthesis, data pipelines, and autonomous agent orchestration. One morning after an update, months of irreplaceable architectural decisions, prompt chains, and custom code disappeared from my IDE sidebar. Clicking them returned a fatal message:
+> Like many researchers and developers, I rely heavily on [Google Antigravity](https://antigravity.google/) for day-to-day coding, clinical protocol synthesis, data pipelines, and autonomous agent orchestration. One morning after an update, months of irreplaceable architectural decisions, prompt chains, and custom code disappeared from my IDE sidebar. Clicking them returned a fatal message:
 > 
 > **`"The conversation could not be loaded because its data was not found."`**
 > 
 > I searched Reddit, developer forums, and bug trackers. Scores of users had posted about the exact same issue with zero resolution. I was on the verge of abandoning the Antigravity ecosystem entirely.
 > 
-> Instead, I spent days reverse-engineering Antigravity's local storage engine and used Antigravity itself as my pair programmer to engineer this vault. Today, every session on my workstation is protected, searchable, and restorable with a single click. I am open-sourcing this vault so no one else has to lose weeks of work to silent eviction.
+> Instead, I spent a day reverse-engineering Antigravity's local storage engine and used Antigravity itself as my pair programmer to engineer this vault. Today, every session on my workstation is protected, searchable, and restorable with a single click. I am open-sourcing this vault so no one else has to lose weeks of work to silent eviction.
 
 ---
 
@@ -254,18 +254,6 @@ OK (0 failures, 0 errors)
 
 #### Q: What operating systems are supported?
 **A:** Windows 10/11, macOS, and Linux. The codebase includes specific protections for Windows (NTFS read-only attribute stripping on Git loose objects) and standard POSIX paths for macOS and Linux.
-
----
-
-## 🤝 Contributing
-
-Contributions, bug reports, and suggestions are welcome!
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -m "feat: add support for custom export formats"`)
-4. Ensure all tests pass (`python -m unittest discover tests -v`)
-5. Push to the branch (`git push origin feature/my-feature`)
-6. Open a Pull Request
 
 ---
 
