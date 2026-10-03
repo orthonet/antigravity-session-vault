@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 
 LIVE_DIR = Path.home() / ".gemini" / "antigravity"
-BACKUP_DIR = Path("d:/Antigravity-Backup")
+BACKUP_DIR = Path(os.environ.get("AGY_BACKUP_DIR", "d:/Antigravity-Backup"))
 
 # Subdirectories
 CONVS_SRC = LIVE_DIR / "conversations"
