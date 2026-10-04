@@ -61,3 +61,9 @@ tests/temp_*/
 *.db-wal
 *.db-shm
 *.db-journal
+
+# Local environment documentation and agent session logs
+MEMORY.md
+WALKTHROUGH.md
+docs/JOURNAL.md
+JOURNAL.md
