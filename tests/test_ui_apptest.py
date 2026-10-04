@@ -450,6 +450,29 @@ class TestStreamlitUIAppTest(unittest.TestCase):
                 f"Expected stop confirmation banner, got: {[i.value for i in at.info]}"
             )
 
+    def test_pinned_badge_display_and_filter(self):
+        """Verify that pinned conversations render the ⭐ Pinned badge and filter correctly by Category."""
+        at = AppTest.from_file("../app.py", default_timeout=20)
+        at.session_state["main_nav_tab"] = "📂 Conversation Explorer"
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"App execution raised: {at.exception}")
+
+        # Filter by Category = Pinned
+        cat_sb = at.selectbox(key="explorer_cat_filter")
+        self.assertIsNotNone(cat_sb)
+        pinned_opt = next((opt for opt in cat_sb.options if "Pinned" in opt), None)
+        self.assertIsNotNone(pinned_opt, f"Expected 'Pinned' option in category filter, got: {cat_sb.options}")
+
+        cat_sb.set_value(pinned_opt).run()
+        self.assertEqual(len(at.exception), 0)
+
+        # Assert markdown contains ⭐ Pinned badge
+        markdown_texts = [m.value for m in at.markdown]
+        self.assertTrue(
+            any("badge-pinned" in m or "⭐ Pinned" in m for m in markdown_texts),
+            "Filtered pinned list must render ⭐ Pinned badge in HTML"
+        )
+
 if __name__ == "__main__":
     unittest.main()
 

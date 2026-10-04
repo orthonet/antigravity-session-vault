@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/streamlit-1.35%2B-FF4B4B.svg)](https://streamlit.io/)
 [![SQLite](https://img.shields.io/badge/sqlite-WAL%20Mode-003B57.svg)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-36%2F36%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-39%2F39%20passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Autonomous Continuous Backup, Lossless Archival Storage, Full-Text Retrieval, Vault Pin Sentry Anti-Re-Eviction Defense, and 1-Click IDE Revival for Google Antigravity.**
@@ -233,7 +233,7 @@ python -m unittest discover tests -v
 ```
 
 ```text
-Ran 36 tests in ~34s
+Ran 39 tests in ~25s
 OK (0 failures, 0 errors)
 ```
 

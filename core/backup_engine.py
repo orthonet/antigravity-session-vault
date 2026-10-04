@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List
@@ -39,18 +40,36 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
     synced_brains = 0
     errors: List[str] = []
 
-    # 1. Mirror pinned annotations
+    # 1. Mirror pinned and unpinned annotations
     pinned_ids = set()
+    unpinned_ids = set()
     if LIVE_ANNOTATIONS_DIR.exists():
         BACKUP_ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
         for f in LIVE_ANNOTATIONS_DIR.glob("*.pbtxt"):
             try:
                 txt = f.read_text(encoding="utf-8", errors="ignore")
-                if "pinned:true" in txt or "pinned: true" in txt:
+                if re.search(r'\bpinned\s*:\s*true\b', txt, re.IGNORECASE):
                     pinned_ids.add(f.stem)
+                elif re.search(r'\bpinned\s*:\s*false\b', txt, re.IGNORECASE):
+                    unpinned_ids.add(f.stem)
                 copy_file_robust(f, BACKUP_ANNOTATIONS_DIR / f.name)
             except Exception as e:
                 logger.debug(f"Annotation copy warning for {f.name}: {e}")
+
+    # Preserve pinned status for archived/evicted sessions whose annotations only exist in backup
+    if BACKUP_ANNOTATIONS_DIR.exists():
+        for f in BACKUP_ANNOTATIONS_DIR.glob("*.pbtxt"):
+            if f.stem not in pinned_ids and f.stem not in unpinned_ids:
+                live_counterpart = LIVE_ANNOTATIONS_DIR / f.name
+                if not live_counterpart.exists():
+                    try:
+                        txt = f.read_text(encoding="utf-8", errors="ignore")
+                        if re.search(r'\bpinned\s*:\s*true\b', txt, re.IGNORECASE):
+                            pinned_ids.add(f.stem)
+                        elif re.search(r'\bpinned\s*:\s*false\b', txt, re.IGNORECASE):
+                            unpinned_ids.add(f.stem)
+                    except Exception:
+                        pass
 
     live_db_files = set(f.stem for f in LIVE_CONVERSATIONS_DIR.glob("*.db")) if LIVE_CONVERSATIONS_DIR.exists() else set()
 
@@ -75,8 +94,8 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
         cat_conn.execute("PRAGMA busy_timeout=10000;")
         cat_cur = cat_conn.cursor()
 
-        cat_cur.execute("SELECT conversation_id, last_modified_time, has_db_file, has_brain_folder, retention_status FROM backed_up_conversations")
-        cat_map = {r[0]: (r[1], bool(r[2]), bool(r[3]), r[4]) for r in cat_cur.fetchall()}
+        cat_cur.execute("SELECT conversation_id, last_modified_time, has_db_file, has_brain_folder, retention_status, is_pinned FROM backed_up_conversations")
+        cat_map = {r[0]: (r[1], bool(r[2]), bool(r[3]), r[4], bool(r[5])) for r in cat_cur.fetchall()}
 
         for r in live_rows:
             row_dict = dict(zip(live_cols, r))
@@ -90,22 +109,29 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
             status = row_dict.get("status", "")
             raw_summary = row_dict.get("raw_summary", None)
 
-            is_pinned = cid in pinned_ids
-            has_live_db = cid in live_db_files
-            src_brain = LIVE_BRAIN_DIR / cid
-            src_brain_exists = src_brain.exists()
-
-            # Check if backup needs update
             cached = cat_map.get(cid)
             has_backup_db_cached = cached[1] if cached else False
             has_backup_brain_cached = cached[2] if cached else False
             cached_ret = cached[3] if cached and len(cached) > 3 else None
+            cached_pinned = cached[4] if cached and len(cached) > 4 else False
 
-            needs_sync = False
-            if not cached:
-                needs_sync = True
-            elif (cached[0] != live_lmt) or (has_live_db and not has_backup_db_cached) or (src_brain_exists and not has_backup_brain_cached):
-                needs_sync = True
+            if cid in pinned_ids:
+                is_pinned = True
+            elif cid in unpinned_ids:
+                is_pinned = False
+            else:
+                is_pinned = cached_pinned
+
+            has_live_db = cid in live_db_files
+            src_brain = LIVE_BRAIN_DIR / cid
+            src_brain_exists = src_brain.exists()
+
+            lmt_changed = (cached is None) or (cached[0] != live_lmt)
+            pin_changed = (cached is None) or (is_pinned != cached_pinned)
+            db_missing = has_live_db and not has_backup_db_cached
+            brain_missing = src_brain_exists and not has_backup_brain_cached
+
+            needs_sync = lmt_changed or pin_changed or db_missing or brain_missing
 
             if needs_sync:
                 has_backup_db = False
@@ -113,29 +139,35 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
 
                 # 3a. Backup .db if exists in live (handles SQLite WAL mode safely)
                 if has_live_db:
-                    src_db = LIVE_CONVERSATIONS_DIR / f"{cid}.db"
-                    dst_db = BACKUP_CONVERSATIONS_DIR / f"{cid}.db"
-                    try:
-                        if backup_sqlite_db_safe(src_db, dst_db):
-                            synced_dbs += 1
-                            has_backup_db = True
-                    except Exception as e:
-                        errors.append(f"DB backup failed for {cid}: {e}")
+                    if lmt_changed or db_missing:
+                        src_db = LIVE_CONVERSATIONS_DIR / f"{cid}.db"
+                        dst_db = BACKUP_CONVERSATIONS_DIR / f"{cid}.db"
+                        try:
+                            if backup_sqlite_db_safe(src_db, dst_db):
+                                synced_dbs += 1
+                                has_backup_db = True
+                        except Exception as e:
+                            errors.append(f"DB backup failed for {cid}: {e}")
+                    else:
+                        has_backup_db = has_backup_db_cached
                 elif cached and cached[1]:
                     has_backup_db = True
 
                 # 3b. Sync brain folder if exists in live (handles Git read-only objects safely)
                 dst_brain = BACKUP_BRAIN_DIR / cid
                 if src_brain_exists:
-                    try:
-                        sync_res = sync_directory_tree(src_brain, dst_brain)
-                        if sync_res.get("copied", 0) > 0:
-                            synced_brains += 1
-                        has_backup_brain = dst_brain.exists()
-                        if sync_res.get("errors"):
-                            errors.extend(sync_res["errors"])
-                    except Exception as e:
-                        errors.append(f"Brain sync failed for {cid}: {e}")
+                    if lmt_changed or brain_missing:
+                        try:
+                            sync_res = sync_directory_tree(src_brain, dst_brain)
+                            if sync_res.get("copied", 0) > 0:
+                                synced_brains += 1
+                            has_backup_brain = dst_brain.exists()
+                            if sync_res.get("errors"):
+                                errors.extend(sync_res["errors"])
+                        except Exception as e:
+                            errors.append(f"Brain sync failed for {cid}: {e}")
+                    else:
+                        has_backup_brain = has_backup_brain_cached
                 elif dst_brain.exists():
                     has_backup_brain = True
 
@@ -186,9 +218,11 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
                     now_utc, raw_summary
                 ))
 
-        # 4. Check for sessions that were live before but now evicted
+        # 4. Check for sessions that were live before but now evicted, or evicted sessions whose pin changed
+        live_cids = set(r[live_cols.index("conversation_id")] for r in live_rows) if live_rows and "conversation_id" in live_cols else set()
         for cid, cached_val in cat_map.items():
             last_lmt, had_db, had_brain = cached_val[:3]
+            cached_pinned = cached_val[4] if len(cached_val) > 4 else False
             if had_db and cid not in live_db_files:
                 cat_cur.execute("""
                 UPDATE backed_up_conversations
@@ -199,6 +233,23 @@ def sync_live_to_backup(auto_protect_pinned: bool = True) -> Dict[str, Any]:
                     END
                 WHERE conversation_id = ?
                 """, (cid,))
+
+            if cid not in live_cids:
+                if cid in pinned_ids:
+                    is_pinned_now = True
+                elif cid in unpinned_ids:
+                    is_pinned_now = False
+                else:
+                    is_pinned_now = cached_pinned
+
+                if is_pinned_now != cached_pinned:
+                    cat_cur.execute("""
+                    UPDATE backed_up_conversations
+                    SET is_pinned = ?,
+                        category = CASE WHEN ? = 1 THEN 'pinned' ELSE category END,
+                        last_synced_time = ?
+                    WHERE conversation_id = ?
+                    """, (int(is_pinned_now), int(is_pinned_now), now_utc, cid))
 
         cat_conn.commit()
     finally:

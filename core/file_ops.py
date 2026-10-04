@@ -3,8 +3,11 @@ import stat
 import shutil
 import sqlite3
 import sys
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
+
+from config import LIVE_ANNOTATIONS_DIR, BACKUP_ANNOTATIONS_DIR
 
 def make_writable(path: Union[str, Path]) -> None:
     """
@@ -177,3 +180,46 @@ def rmtree_robust(target_dir: Union[str, Path]) -> None:
         shutil.rmtree(target, onexc=lambda func, path, exc: _handle_remove_readonly(func, path, None))
     else:
         shutil.rmtree(target, onerror=_handle_remove_readonly)
+
+def update_annotation_pin_state(
+    cid: str,
+    is_pinned: bool,
+    title: Optional[str] = None,
+    live_ann_dir: Optional[Path] = None,
+    backup_ann_dir: Optional[Path] = None
+) -> bool:
+    """
+    Safely writes or updates the pinned status in the protobuf annotation file (.pbtxt)
+    across both live Antigravity annotations and the Vault backup annotations directory.
+    Ensures that pinning operations within Session Vault or Antigravity stay in lockstep.
+    """
+    target_live = live_ann_dir if live_ann_dir is not None else LIVE_ANNOTATIONS_DIR
+    target_backup = backup_ann_dir if backup_ann_dir is not None else BACKUP_ANNOTATIONS_DIR
+
+    pin_str = "pinned:true" if is_pinned else "pinned:false"
+    success = False
+
+    for ann_dir in [target_live, target_backup]:
+        if ann_dir is None:
+            continue
+        try:
+            ann_dir.mkdir(parents=True, exist_ok=True)
+            ann_file = ann_dir / f"{cid}.pbtxt"
+            if ann_file.exists():
+                make_writable(ann_file)
+                txt = ann_file.read_text(encoding="utf-8", errors="ignore")
+                if re.search(r'\bpinned\s*:\s*(true|false)\b', txt, re.IGNORECASE):
+                    new_txt = re.sub(r'\bpinned\s*:\s*(true|false)\b', pin_str, txt, flags=re.IGNORECASE)
+                else:
+                    new_txt = txt.rstrip() + f"  {pin_str}\n"
+            else:
+                if title:
+                    new_txt = f'title:"{title}"  {pin_str}\n'
+                else:
+                    new_txt = f'{pin_str}\n'
+            ann_file.write_text(new_txt, encoding="utf-8")
+            success = True
+        except Exception:
+            pass
+
+    return success

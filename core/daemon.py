@@ -49,15 +49,26 @@ def is_pid_running(pid: int) -> bool:
         except OSError:
             return False
 
-def acquire_pid_lock() -> bool:
+def resolve_state_paths(state_dir: Optional[Union[str, Path]] = None) -> Tuple[Path, Path, Path]:
+    """
+    Resolves (pid_file, heartbeat_file, log_file) given an optional state_dir override.
+    Falls back to config.DAEMON_PID_FILE, DAEMON_HEARTBEAT_FILE, and DAEMON_LOG_FILE.
+    """
+    if state_dir is not None:
+        sd = Path(state_dir).resolve()
+        return (sd / "daemon.pid", sd / "daemon_heartbeat.json", sd / "daemon.log")
+    return (DAEMON_PID_FILE, DAEMON_HEARTBEAT_FILE, DAEMON_LOG_FILE)
+
+def acquire_pid_lock(pid_file: Optional[Path] = None) -> bool:
     """
     Ensures that only one daemon instance runs at a time.
     Returns True if lock acquired, False if another instance is active.
     """
-    DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if DAEMON_PID_FILE.exists():
+    target_pid = pid_file if pid_file is not None else DAEMON_PID_FILE
+    target_pid.parent.mkdir(parents=True, exist_ok=True)
+    if target_pid.exists():
         try:
-            old_pid = int(DAEMON_PID_FILE.read_text(encoding="utf-8").strip())
+            old_pid = int(target_pid.read_text(encoding="utf-8").strip())
             if is_pid_running(old_pid):
                 safe_print(f"[{datetime.now().isoformat()}] Another daemon instance is already active (PID: {old_pid}). Exiting.")
                 return False
@@ -67,31 +78,33 @@ def acquire_pid_lock() -> bool:
             pass
 
     try:
-        DAEMON_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        target_pid.write_text(str(os.getpid()), encoding="utf-8")
         return True
     except Exception as e:
         safe_print(f"[{datetime.now().isoformat()}] Warning: Could not write PID file: {e}")
         return True
 
-def release_pid_lock():
+def release_pid_lock(pid_file: Optional[Path] = None):
     """Removes the PID file upon daemon shutdown."""
+    target_pid = pid_file if pid_file is not None else DAEMON_PID_FILE
     try:
-        if DAEMON_PID_FILE.exists():
+        if target_pid.exists():
             current_pid = str(os.getpid())
-            stored_pid = DAEMON_PID_FILE.read_text(encoding="utf-8").strip()
+            stored_pid = target_pid.read_text(encoding="utf-8").strip()
             if stored_pid == current_pid:
-                DAEMON_PID_FILE.unlink(missing_ok=True)
+                target_pid.unlink(missing_ok=True)
     except Exception:
         pass
 
-def mark_heartbeat_stopped():
+def mark_heartbeat_stopped(heartbeat_file: Optional[Path] = None):
     """Updates the heartbeat file to 'stopped' state."""
-    if DAEMON_HEARTBEAT_FILE.exists():
+    target_hb = heartbeat_file if heartbeat_file is not None else DAEMON_HEARTBEAT_FILE
+    if target_hb.exists():
         try:
-            with open(DAEMON_HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+            with open(target_hb, "r", encoding="utf-8") as f:
                 data = json.load(f)
             data["status"] = "stopped"
-            with open(DAEMON_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            with open(target_hb, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
@@ -101,15 +114,21 @@ def signal_handler(signum, frame):
     safe_print(f"\n[{datetime.now().isoformat()}] Shutdown signal received (signal {signum}). Gracefully stopping daemon...")
     running = False
 
-def start_daemon_process(interval: int = 30) -> Tuple[bool, Union[int, str]]:
+def start_daemon_process(
+    interval: int = 30,
+    state_dir: Optional[Union[str, Path]] = None
+) -> Tuple[bool, Union[int, str]]:
     """
     Launches the background daemon as a detached subprocess on Windows.
+    Optionally accepts a state_dir to isolate daemon PID, heartbeat, and log files (e.g. for testing).
     Returns (True, pid) on success, or (False, error_message) on failure.
     """
-    # Check if already running
-    if DAEMON_PID_FILE.exists():
+    pid_file, hb_file, log_file = resolve_state_paths(state_dir)
+
+    # Check if already running in this state_dir
+    if pid_file.exists():
         try:
-            cur_pid = int(DAEMON_PID_FILE.read_text(encoding="utf-8").strip())
+            cur_pid = int(pid_file.read_text(encoding="utf-8").strip())
             if is_pid_running(cur_pid):
                 return True, cur_pid
         except Exception:
@@ -124,13 +143,19 @@ def start_daemon_process(interval: int = 30) -> Tuple[bool, Union[int, str]]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     env["PYTHONIOENCODING"] = "utf-8"
+    if state_dir is not None:
+        env["AGY_STATE_DIR"] = str(Path(state_dir).resolve())
 
-    DAEMON_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [sys.executable, str(daemon_script), str(interval)]
+    if state_dir is not None:
+        cmd.append(str(Path(state_dir).resolve()))
 
     try:
-        log_f = open(DAEMON_LOG_FILE, "a", encoding="utf-8")
+        log_f = open(log_file, "a", encoding="utf-8")
         proc = subprocess.Popen(
-            [sys.executable, str(daemon_script), str(interval)],
+            cmd,
             cwd=str(PROJECT_ROOT),
             env=env,
             creationflags=creationflags,
@@ -146,9 +171,9 @@ def start_daemon_process(interval: int = 30) -> Tuple[bool, Union[int, str]]:
             time.sleep(0.25)
             if not is_pid_running(proc.pid):
                 break
-            if DAEMON_HEARTBEAT_FILE.exists():
+            if hb_file.exists():
                 try:
-                    with open(DAEMON_HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+                    with open(hb_file, "r", encoding="utf-8") as f:
                         hb_data = json.load(f)
                     if hb_data.get("pid") == proc.pid and hb_data.get("status") == "active":
                         break
@@ -157,9 +182,9 @@ def start_daemon_process(interval: int = 30) -> Tuple[bool, Union[int, str]]:
 
         if not is_pid_running(proc.pid):
             err_detail = "Process terminated immediately."
-            if DAEMON_LOG_FILE.exists():
+            if log_file.exists():
                 try:
-                    lines = DAEMON_LOG_FILE.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                    lines = log_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
                     if lines:
                         err_detail = " ".join(lines[-3:])
                 except Exception:
@@ -174,16 +199,19 @@ def start_daemon_process(interval: int = 30) -> Tuple[bool, Union[int, str]]:
         safe_print(f"Failed to launch background daemon: {e}")
         return False, str(e)
 
-def stop_daemon_process() -> bool:
+def stop_daemon_process(state_dir: Optional[Union[str, Path]] = None) -> bool:
     """
     Terminates the active background daemon process cleanly.
+    Optionally accepts a state_dir to target a specific isolated daemon instance.
     """
-    if not DAEMON_PID_FILE.exists():
-        mark_heartbeat_stopped()
+    pid_file, hb_file, _ = resolve_state_paths(state_dir)
+
+    if not pid_file.exists():
+        mark_heartbeat_stopped(hb_file)
         return True
 
     try:
-        pid = int(DAEMON_PID_FILE.read_text(encoding="utf-8").strip())
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
         if is_pid_running(pid):
             if sys.platform == "win32":
                 # Use taskkill /PID /T /F for reliable termination on Windows
@@ -192,22 +220,24 @@ def stop_daemon_process() -> bool:
                 os.kill(pid, signal.SIGTERM)
             time.sleep(0.5)
 
-        DAEMON_PID_FILE.unlink(missing_ok=True)
-        mark_heartbeat_stopped()
+        pid_file.unlink(missing_ok=True)
+        mark_heartbeat_stopped(hb_file)
         return True
     except Exception as e:
         safe_print(f"Error stopping daemon process: {e}")
         return False
 
-def get_daemon_live_status() -> Tuple[str, str, Dict[str, Any]]:
+def get_daemon_live_status(state_dir: Optional[Union[str, Path]] = None) -> Tuple[str, str, Dict[str, Any]]:
     """
     Inspects PID file and heartbeat to accurately report daemon status.
+    Optionally accepts a state_dir to inspect an isolated daemon instance.
     Returns: (status_label, detail_message, heartbeat_dict)
     """
+    pid_file, hb_file, _ = resolve_state_paths(state_dir)
     hb = {}
-    if DAEMON_HEARTBEAT_FILE.exists():
+    if hb_file.exists():
         try:
-            with open(DAEMON_HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+            with open(hb_file, "r", encoding="utf-8") as f:
                 hb = json.load(f)
         except Exception:
             pass
@@ -227,9 +257,9 @@ def get_daemon_live_status() -> Tuple[str, str, Dict[str, Any]]:
         except Exception:
             pass
 
-    if DAEMON_PID_FILE.exists():
+    if pid_file.exists():
         try:
-            pid = int(DAEMON_PID_FILE.read_text(encoding="utf-8").strip())
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
             if is_pid_running(pid):
                 hb_pid = hb.get("pid")
                 if hb_pid == pid and hb_time:
@@ -247,7 +277,7 @@ def get_daemon_live_status() -> Tuple[str, str, Dict[str, Any]]:
                 return ("🟢 Active", f"PID {pid} • Initial sync in progress...", hb)
             else:
                 # Stale PID file
-                DAEMON_PID_FILE.unlink(missing_ok=True)
+                pid_file.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -256,14 +286,16 @@ def get_daemon_live_status() -> Tuple[str, str, Dict[str, Any]]:
 
     return ("⚪ Inactive", "Daemon not running", hb)
 
-def run_daemon(interval: int = POLL_INTERVAL_SECONDS):
+def run_daemon(interval: int = POLL_INTERVAL_SECONDS, state_dir: Optional[Union[str, Path]] = None):
     global running
 
-    if not acquire_pid_lock():
+    pid_file, hb_file, _ = resolve_state_paths(state_dir)
+
+    if not acquire_pid_lock(pid_file):
         sys.exit(0)
 
-    atexit.register(release_pid_lock)
-    atexit.register(mark_heartbeat_stopped)
+    atexit.register(release_pid_lock, pid_file)
+    atexit.register(mark_heartbeat_stopped, hb_file)
 
     # Register OS signals for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -295,8 +327,8 @@ def run_daemon(interval: int = POLL_INTERVAL_SECONDS):
 
                 # Update heartbeat file
                 try:
-                    DAEMON_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    with open(DAEMON_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                    hb_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(hb_file, "w", encoding="utf-8") as f:
                         json.dump({
                             "last_heartbeat": now_iso,
                             "status": "active",
@@ -317,12 +349,12 @@ def run_daemon(interval: int = POLL_INTERVAL_SECONDS):
             now_iso = datetime.now(timezone.utc).isoformat()
             safe_print(f"[{now_iso}] Uncaught error during sync cycle: {e}")
             try:
-                if DAEMON_HEARTBEAT_FILE.exists():
-                    with open(DAEMON_HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+                if hb_file.exists():
+                    with open(hb_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     data["last_error"] = str(e)
                     data["last_error_time"] = now_iso
-                    with open(DAEMON_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                    with open(hb_file, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2)
             except Exception:
                 pass
@@ -337,4 +369,5 @@ def run_daemon(interval: int = POLL_INTERVAL_SECONDS):
 
 if __name__ == "__main__":
     interval = int(sys.argv[1]) if len(sys.argv) > 1 else POLL_INTERVAL_SECONDS
-    run_daemon(interval)
+    state_dir = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("AGY_STATE_DIR")
+    run_daemon(interval, state_dir=state_dir)

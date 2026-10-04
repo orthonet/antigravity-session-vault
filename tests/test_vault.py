@@ -2,6 +2,7 @@ import os
 import sys
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add project root to sys.path
@@ -22,11 +23,13 @@ from core.backup_engine import sync_live_to_backup
 from core.search_engine import search_backup_conversations, highlight_snippet
 from core.file_ops import copy_file_robust, backup_sqlite_db_safe, sync_directory_tree, rmtree_robust
 from core.daemon import acquire_pid_lock, release_pid_lock, is_pid_running, run_pin_sentry
+from unittest.mock import patch
 from core.restorer import (
     restore_conversation,
     validate_conversation_id,
     normalize_workspace_uri,
-    check_sqlite_integrity
+    check_sqlite_integrity,
+    ensure_live_summaries_schema
 )
 
 class TestAntigravityVault(unittest.TestCase):
@@ -863,7 +866,8 @@ class TestAntigravityVault(unittest.TestCase):
                     cur = conn.cursor()
                     cur.execute("SELECT last_modified_time FROM conversation_summaries WHERE conversation_id = ?", (cid_active,))
                     new_lmt = cur.fetchone()[0]
-                    self.assertIn("2026-10-03", new_lmt, "Active session timestamp must be refreshed to today")
+                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    self.assertIn(today_str, new_lmt, "Active session timestamp must be refreshed to today")
 
                 # Verify cid_evicted was resurrected into mock_live_conv
                 resurrected_live_db = mock_live_conv / f"{cid_evicted}.db"
@@ -979,7 +983,7 @@ class TestAntigravityVault(unittest.TestCase):
         self.assertIsInstance(hb, dict)
 
     def test_26_daemon_subprocess_spawning_and_survival(self):
-        """Verify detached background daemon subprocess spawns cleanly, survives import, and stops cleanly."""
+        """Verify detached background daemon subprocess spawns cleanly, survives import, and stops cleanly in an isolated test environment."""
         from core.daemon import (
             start_daemon_process,
             stop_daemon_process,
@@ -988,37 +992,206 @@ class TestAntigravityVault(unittest.TestCase):
         )
         import time
 
-        # Ensure no prior daemon is lingering
-        stop_daemon_process()
-        time.sleep(0.5)
+        # Record pre-test production daemon status to verify non-interference invariant
+        prod_status_before, prod_detail_before, _ = get_daemon_live_status()
 
-        # Launch detached daemon subprocess with 10s interval
-        success, res = start_daemon_process(interval=10)
-        self.assertTrue(success, f"start_daemon_process failed: {res}")
-        self.assertIsInstance(res, int)
-        self.assertGreater(res, 0)
-        daemon_pid = res
+        # Hermetically isolated test state directory
+        test_state_dir = Path("D:/test_agy_daemon_state")
+        if test_state_dir.exists():
+            rmtree_robust(test_state_dir)
+        test_state_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Verify PID is actively running at OS level
-            self.assertTrue(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should be active")
-
-            # Check status reporting reflects active daemon
-            status, detail, hb = get_daemon_live_status()
-            self.assertTrue(status.startswith("🟢"), f"Expected 🟢 Active status, got: {status}")
-
-            # Verify idempotency: calling start_daemon_process again returns the same running PID
-            success_again, res_again = start_daemon_process(interval=10)
-            self.assertTrue(success_again)
-            self.assertEqual(res_again, daemon_pid)
-        finally:
-            # Cleanly terminate the daemon
-            stopped = stop_daemon_process()
-            self.assertTrue(stopped)
+            # Ensure no prior test daemon is lingering in sandbox
+            stop_daemon_process(state_dir=test_state_dir)
             time.sleep(0.5)
-            self.assertFalse(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should have stopped")
-            status_after, _, _ = get_daemon_live_status()
-            self.assertEqual(status_after, "⚪ Inactive")
+
+            # Launch detached daemon subprocess with 10s interval targeting sandbox state_dir
+            success, res = start_daemon_process(interval=10, state_dir=test_state_dir)
+            self.assertTrue(success, f"start_daemon_process failed: {res}")
+            self.assertIsInstance(res, int)
+            self.assertGreater(res, 0)
+            daemon_pid = res
+
+            try:
+                # Verify PID is actively running at OS level
+                self.assertTrue(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should be active")
+
+                # Check status reporting reflects active daemon in sandbox
+                status, detail, hb = get_daemon_live_status(state_dir=test_state_dir)
+                self.assertTrue(status.startswith("🟢"), f"Expected 🟢 Active status, got: {status}")
+
+                # Verify idempotency: calling start_daemon_process again returns the same running PID
+                success_again, res_again = start_daemon_process(interval=10, state_dir=test_state_dir)
+                self.assertTrue(success_again)
+                self.assertEqual(res_again, daemon_pid)
+            finally:
+                # Cleanly terminate the sandbox daemon
+                stopped = stop_daemon_process(state_dir=test_state_dir)
+                self.assertTrue(stopped)
+                time.sleep(0.5)
+                self.assertFalse(is_pid_running(daemon_pid), f"Daemon process {daemon_pid} should have stopped")
+                status_after, _, _ = get_daemon_live_status(state_dir=test_state_dir)
+                self.assertEqual(status_after, "⚪ Inactive")
+
+            # Mathematical / Environmental Invariant: Production daemon status MUST NOT have been disturbed
+            prod_status_after, prod_detail_after, _ = get_daemon_live_status()
+            self.assertEqual(prod_status_after, prod_status_before, "Production daemon status must remain invariant across test runs")
+            if "PID" in prod_detail_before:
+                self.assertIn(prod_detail_before.split(" • ")[0], prod_detail_after, "Production daemon PID must not be altered by test runs")
+        finally:
+            rmtree_robust(test_state_dir)
+
+    def test_27_sync_detects_pin_status_change_without_lmt_change(self):
+        """Verify that sync_live_to_backup detects pinned annotations changes even when last_modified_time is identical."""
+        from unittest.mock import patch
+        test_dir = Path("D:/test_agy_sync_pin_change")
+        if test_dir.exists():
+            rmtree_robust(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            mock_live_sum = test_dir / "conversation_summaries.db"
+            mock_live_conv = test_dir / "live_conversations"
+            mock_live_ann = test_dir / "live_annotations"
+            mock_backup_conv = test_dir / "backup_conversations"
+            mock_backup_brain = test_dir / "backup_brain"
+            mock_backup_ann = test_dir / "backup_annotations"
+            mock_backup_cat = test_dir / "backup_catalog.db"
+
+            mock_live_conv.mkdir(parents=True, exist_ok=True)
+            mock_live_ann.mkdir(parents=True, exist_ok=True)
+            mock_backup_conv.mkdir(parents=True, exist_ok=True)
+            mock_backup_brain.mkdir(parents=True, exist_ok=True)
+            mock_backup_ann.mkdir(parents=True, exist_ok=True)
+
+            CatalogManager(mock_backup_cat)._init_db()
+
+            cid = "8c70a0c0-78fe-4c47-9bd5-4df56a4e5077"
+            static_lmt = "2026-10-04 03:23:23.5104227+00:00"
+
+            # 1. Populate live .db and backup .db
+            (mock_live_conv / f"{cid}.db").write_text("live db content")
+            (mock_backup_conv / f"{cid}.db").write_text("backup db content")
+
+            # 2. Insert into live summaries
+            with sqlite3.connect(mock_live_sum) as conn:
+                ensure_live_summaries_schema(conn)
+                conn.execute("""
+                INSERT INTO conversation_summaries (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    workspace_uris, status, last_user_input_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (cid, "OrthopaedicsOne AI Architecture Briefing", "Briefing Preview", 72, static_lmt, '[""]', "CASCADE_RUN_STATUS_IDLE", static_lmt))
+                conn.commit()
+
+            # 3. Insert into catalog as NOT pinned
+            with sqlite3.connect(mock_backup_cat) as conn:
+                conn.execute("""
+                INSERT INTO backed_up_conversations (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    retention_status, has_db_file, has_brain_folder, is_pinned,
+                    is_evicted_from_live, category
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (cid, "OrthopaedicsOne AI Architecture Briefing", "Briefing Preview", 72, static_lmt, "complete_active", 1, 0, 0, 0, "interactive"))
+                conn.commit()
+
+            # 4. Now, the user pins the conversation in Antigravity -> creates live annotation with pinned:true
+            # Notice static_lmt in conversation_summaries.db is UNCHANGED!
+            (mock_live_ann / f"{cid}.pbtxt").write_text('title:"OrthopaedicsOne AI Architecture Briefing" pinned:true\n', encoding="utf-8")
+
+            with patch("core.backup_engine.LIVE_SUMMARIES_DB", mock_live_sum), \
+                 patch("core.backup_engine.LIVE_CONVERSATIONS_DIR", mock_live_conv), \
+                 patch("core.backup_engine.LIVE_ANNOTATIONS_DIR", mock_live_ann), \
+                 patch("core.backup_engine.BACKUP_CONVERSATIONS_DIR", mock_backup_conv), \
+                 patch("core.backup_engine.BACKUP_BRAIN_DIR", mock_backup_brain), \
+                 patch("core.backup_engine.BACKUP_ANNOTATIONS_DIR", mock_backup_ann), \
+                 patch("core.backup_engine.BACKUP_CATALOG_DB", mock_backup_cat):
+
+                res = sync_live_to_backup(auto_protect_pinned=False)
+                self.assertTrue(res.get("success"))
+                self.assertEqual(res["synced_dbs"], 0, "Redundant DB copy must be skipped when only pin status changes")
+
+                # Verify catalog updated to pinned
+                with sqlite3.connect(mock_backup_cat) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT is_pinned, category FROM backed_up_conversations WHERE conversation_id = ?", (cid,))
+                    is_pin, cat = cur.fetchone()
+                    self.assertEqual(is_pin, 1, "Catalog must update is_pinned to 1")
+                    self.assertEqual(cat, "pinned", "Catalog must update category to 'pinned'")
+
+                # Verify annotation copied to backup
+                self.assertTrue((mock_backup_ann / f"{cid}.pbtxt").exists())
+
+                # 5. Now simulate unpinning in Antigravity
+                (mock_live_ann / f"{cid}.pbtxt").write_text('title:"OrthopaedicsOne AI Architecture Briefing" pinned:false\n', encoding="utf-8")
+                res_unpin = sync_live_to_backup(auto_protect_pinned=False)
+                self.assertTrue(res_unpin.get("success"))
+
+                with sqlite3.connect(mock_backup_cat) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT is_pinned, category FROM backed_up_conversations WHERE conversation_id = ?", (cid,))
+                    is_pin, cat = cur.fetchone()
+                    self.assertEqual(is_pin, 0, "Catalog must update is_pinned to 0 when unpinned")
+                    self.assertEqual(cat, "interactive", "Catalog must reclassify category when unpinned")
+        finally:
+            rmtree_robust(test_dir)
+
+    def test_28_catalog_update_pinned_status_bidirectional_sync(self):
+        """Verify CatalogManager.update_pinned_status synchronizes both DB category and annotation files."""
+        test_dir = Path("D:/test_agy_cat_pin_bidirectional")
+        if test_dir.exists():
+            rmtree_robust(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            mock_cat_db = test_dir / "catalog.db"
+            mock_live_ann = test_dir / "live_annotations"
+            mock_backup_ann = test_dir / "backup_annotations"
+            mock_live_ann.mkdir(parents=True, exist_ok=True)
+            mock_backup_ann.mkdir(parents=True, exist_ok=True)
+
+            cat = CatalogManager(mock_cat_db)
+            cid = "99998888-7777-6666-5555-444433332222"
+
+            with sqlite3.connect(mock_cat_db) as conn:
+                conn.execute("""
+                INSERT INTO backed_up_conversations (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    retention_status, has_db_file, has_brain_folder, is_pinned,
+                    is_evicted_from_live, category
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (cid, "Strategic Planning", "Preview text", 20, "2026-10-01", "complete_active", 1, 0, 0, 0, "interactive"))
+                conn.commit()
+
+            # Pre-create live annotation with pinned:false
+            (mock_live_ann / f"{cid}.pbtxt").write_text('title:"Strategic Planning" pinned:false\n', encoding="utf-8")
+
+            with patch("core.file_ops.LIVE_ANNOTATIONS_DIR", mock_live_ann), \
+                 patch("core.file_ops.BACKUP_ANNOTATIONS_DIR", mock_backup_ann):
+
+                # 1. Pin via catalog
+                cat.update_pinned_status(cid, True)
+
+                # Verify DB
+                conv = cat.get_conversation_by_id(cid)
+                self.assertEqual(conv["is_pinned"], 1)
+                self.assertEqual(conv["category"], "pinned")
+
+                # Verify annotation files in both directories
+                live_txt = (mock_live_ann / f"{cid}.pbtxt").read_text(encoding="utf-8")
+                backup_txt = (mock_backup_ann / f"{cid}.pbtxt").read_text(encoding="utf-8")
+                self.assertIn("pinned:true", live_txt)
+                self.assertIn("pinned:true", backup_txt)
+
+                # 2. Unpin via catalog
+                cat.update_pinned_status(cid, False)
+                conv_unpin = cat.get_conversation_by_id(cid)
+                self.assertEqual(conv_unpin["is_pinned"], 0)
+                self.assertEqual(conv_unpin["category"], "interactive")
+
+                live_txt_unpin = (mock_live_ann / f"{cid}.pbtxt").read_text(encoding="utf-8")
+                self.assertIn("pinned:false", live_txt_unpin)
+        finally:
+            rmtree_robust(test_dir)
 
 if __name__ == "__main__":
     unittest.main()

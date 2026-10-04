@@ -51,3 +51,12 @@ Before concluding any turn:
 2. Run the unified test suite: `python -m unittest discover tests -v` (or execute `run_tests.bat`).
 3. Ensure **0 failures and 0 errors** across all backend and headless UI tests.
 4. Record objective, root cause, artifacts, and verification evidence in `docs/JOURNAL.md`.
+
+---
+
+## 7. Hermetic Test Isolation & Production Daemon Preservation
+
+- **Rule**: Tests MUST NEVER operate on, kill, or mutate active production processes or shared state files (`DAEMON_PID_FILE`, `DAEMON_HEARTBEAT_FILE`, `DAEMON_LOG_FILE`).
+- **Isolation Mandate**: All tests verifying daemon lifecycle, process spawning, or PID locking must pass an isolated `state_dir` sandbox (or set `AGY_STATE_DIR`).
+- **Daemon Invariance**: Any test touching process management must record the production daemon's live status before execution and assert that its running status (`🟢 Active`) and PID remain 100% unaltered after test completion.
+

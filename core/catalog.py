@@ -242,9 +242,34 @@ class CatalogManager:
             conn.commit()
 
     def update_pinned_status(self, cid: str, is_pinned: bool):
+        from core.classifier import classify_session
+        from core.file_ops import update_annotation_pin_state
+
+        title = ""
         with self._get_connection() as conn:
-            conn.execute("UPDATE backed_up_conversations SET is_pinned = ? WHERE conversation_id = ?", (int(is_pinned), cid))
+            cur = conn.cursor()
+            cur.execute("SELECT title, preview, step_count FROM backed_up_conversations WHERE conversation_id = ?", (cid,))
+            row = cur.fetchone()
+            if row:
+                title = row["title"] if "title" in row.keys() else ""
+                preview = row["preview"] if "preview" in row.keys() else ""
+                step_count = row["step_count"] if "step_count" in row.keys() else 0
+            else:
+                title, preview, step_count = "", "", 0
+
+            new_category = classify_session(title, preview, step_count, is_pinned)
+
+            conn.execute(
+                "UPDATE backed_up_conversations SET is_pinned = ?, category = ? WHERE conversation_id = ?",
+                (int(is_pinned), new_category, cid)
+            )
             conn.commit()
+
+        # Bidirectional sync to live and backup annotations
+        try:
+            update_annotation_pin_state(cid, is_pinned, title=title)
+        except Exception:
+            pass
 
     def upgrade_to_imported(self, cid: str, has_db: bool, has_brain: bool):
         with self._get_connection() as conn:

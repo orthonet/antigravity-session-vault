@@ -892,6 +892,7 @@ with tab_explore:
         cat_filter = st.selectbox(
             "Category",
             ["All", "interactive", "automated_queue", "pinned"],
+            key="explorer_cat_filter",
             format_func=lambda x: {
                 "All": f"All Categories ({total_db_count:,})",
                 "interactive": f"👤 Interactive Human ({cat_counts.get('interactive', 0):,})",
@@ -905,12 +906,13 @@ with tab_explore:
         ws_filter = st.selectbox(
             "Workspace",
             workspaces,
+            key="explorer_ws_filter",
             format_func=lambda x: f"All Workspaces ({total_db_count:,})" if x == "All" else f"{x.replace('file:///', '').replace('%3A', ':')} ({ws_count_map.get(x, 0):,})"
         )
 
     col_search, col_sort = st.columns([2.5, 1])
     with col_search:
-        search_query = st.text_input("🔍 Search by Title, Conversation ID, or Notes", placeholder="e.g. Content Generator, Journal Abstract, UUID...")
+        search_query = st.text_input("🔍 Search by Title, Conversation ID, or Notes", key="explorer_search_query", placeholder="e.g. Content Generator, Journal Abstract, UUID...")
     with col_sort:
         sort_choice = st.selectbox(
             "Sort Order",
@@ -920,6 +922,7 @@ with tab_explore:
                 ("step_count DESC", "Steps (Highest First)"),
                 ("title ASC", "Title (A-Z)")
             ],
+            key="explorer_sort_choice",
             format_func=lambda x: x[1]
         )
 
